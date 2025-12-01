@@ -10,7 +10,7 @@ def git_deps():
     git_repository(
         name = "aiter_src",
         remote = "https://github.com/ROCm/aiter.git",
-        commit = "007fe7aa070d827bbdad398a578f403057a34e87", # add several ds shapes to fp4 tuned config (#1131)
+        commit = "329d07ba5d77f7d6b2a0557174288c5707f95e5f", # [Triton] DS a16w8 GEMM and fused reduce_rms_fp8_group_quant (#1328)
         recursive_init_submodules = True,
         patches = ["//3rdparty/aiter:aiter.patch", "//3rdparty/aiter:gemm_a8w8.patch"],
         patch_cmds = [
@@ -54,9 +54,11 @@ def git_deps():
             "echo 'if __name__ == \"__main__\":' >> build_aiter_module.py",
             "echo '    build_aiter_module(\"module_aiter_enum\")' >> build_aiter_module.py",
             "echo '    build_aiter_module(\"module_custom_all_reduce\")' >> build_aiter_module.py",
+            "echo '    build_aiter_module(\"module_quick_all_reduce\")' >> build_aiter_module.py",
             "echo '    build_aiter_module(\"module_norm\")' >> build_aiter_module.py",
             "echo '    build_aiter_module(\"module_rmsnorm\")' >> build_aiter_module.py",
             "echo '    build_aiter_module(\"module_mha_fwd\")' >> build_aiter_module.py",
+            "echo '    build_aiter_module(\"module_fmha_v3_varlen_fwd\")' >> build_aiter_module.py",
             "echo '    build_aiter_module(\"module_gemm_a8w8_blockscale\")' >> build_aiter_module.py",
             "echo '    build_aiter_module(\"module_quant\")' >> build_aiter_module.py",
             "echo '    build_aiter_module(\"module_smoothquant\")' >> build_aiter_module.py",

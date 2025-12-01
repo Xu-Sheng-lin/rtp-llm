@@ -36,7 +36,7 @@ public class DefaultCacheAwareService implements CacheAwareService {
     public Map<String, Integer> findMatchingEngines(List<Long> blockCacheKeys,
         String modelName, RoleType roleType, String group) {
 
-        long startTime = System.currentTimeMillis();
+        long startTime = System.nanoTime() / 1000;
         
         try {
             if (blockCacheKeys == null || blockCacheKeys.isEmpty()) {
@@ -58,7 +58,7 @@ public class DefaultCacheAwareService implements CacheAwareService {
     
     @Override
     public WorkerCacheUpdateResult updateEngineBlockCache(WorkerStatus workerStatus) {
-        long startTime = System.currentTimeMillis();
+        long startTime = System.nanoTime() / 1000;
         String engineIpPort = workerStatus.getIpPort();
         String role = workerStatus.getRole();
 
@@ -88,7 +88,7 @@ public class DefaultCacheAwareService implements CacheAwareService {
             
             return result;
                 
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log.error("Error updating worker cache for: {}", engineIpPort, e);
             
             WorkerCacheUpdateResult result = buildFailureResult(engineIpPort, e.getMessage());
@@ -110,7 +110,6 @@ public class DefaultCacheAwareService implements CacheAwareService {
             .availableKvCache(cacheStatus.getAvailableKvCache())
             .totalKvCache(cacheStatus.getTotalKvCache())
             .cacheVersion(cacheStatus.getVersion())
-            .timestamp(System.currentTimeMillis())
             .build();
     }
     
@@ -122,7 +121,6 @@ public class DefaultCacheAwareService implements CacheAwareService {
             .success(false)
             .engineIpPort(engineIpPort)
             .errorMessage(errorMessage)
-            .timestamp(System.currentTimeMillis())
             .build();
     }
 }
