@@ -6,7 +6,16 @@ import librtp_compute_ops
 import libth_transformer_config
 import torch
 import typing
-__all__: list[str] = ['FlashInferAttnParams', 'FlashInferDecodeOp', 'FlashInferPrefillOp', 'FusedMoEOp', 'FusedRopeKVCacheDecodeOp', 'FusedRopeKVCachePrefillOp', 'KVBlockArray', 'RtpProcessGroup', 'RtpProcessGroupType', 'SelectTopkOp', 'TRTAttn', 'TRTAttnOp', 'XQAAttnOp', 'XQAParams', 'cutlass_moe_mm', 'embedding', 'embedding_bert', 'fill_mla_params', 'fused_add_layernorm', 'fused_add_rmsnorm', 'fused_qk_rmsnorm', 'get_cutlass_batched_moe_mm_data', 'get_cutlass_moe_mm_data', 'get_cutlass_moe_mm_without_permute_info', 'layernorm', 'moe_post_reorder', 'moe_pre_reorder', 'moe_topk_softmax', 'per_tensor_quant_fp8', 'per_token_group_quant_fp8', 'per_token_group_quant_int8', 'per_token_quant_fp8', 'rmsnorm', 'silu_and_mul', 'trt_fp8_quantize_128', 'trt_fp8_quantize_128_inplace', 'write_cache_store']
+__all__: list[str] = ['FlashInferAttnParams', 'FlashInferDecodeOp', 'FlashInferPrefillOp', 'FusedMoEOp',
+                      'FusedRopeKVCacheDecodeOp', 'FusedRopeKVCachePrefillOp', 'KVBlockArray', 'RtpProcessGroup',
+                      'RtpProcessGroupType', 'SelectTopkOp', 'TRTAttn', 'TRTAttnOp', 'XQAAttnOp', 'XQAParams',
+                      'cutlass_moe_mm', 'embedding', 'embedding_bert', 'fill_mla_params', 'fused_add_layernorm',
+                      'fused_add_rmsnorm', 'fused_qk_rmsnorm', 'get_cutlass_batched_moe_mm_data',
+                      'get_cutlass_moe_mm_data', 'get_cutlass_moe_mm_without_permute_info', 'layernorm',
+                      'moe_post_reorder', 'moe_pre_reorder', 'moe_topk_softmax', 'per_tensor_quant_fp8',
+                      'per_token_group_quant_fp8', 'per_token_group_quant_int8', 'per_token_quant_fp8',
+                      'rmsnorm', 'silu_and_mul', 'trt_fp8_quantize_128', 'trt_fp8_quantize_128_inplace',
+                      'write_cache_store', 'apply_rope_pos_ids_cos_sin_cache', 'append_paged_mla_kv_cache']
 class FlashInferAttnParams(librtp_compute_ops.ParamsBase):
     def __init__(self) -> None:
         ...
@@ -209,4 +218,17 @@ def trt_fp8_quantize_128_inplace(input: torch.Tensor, output_q: torch.Tensor, ou
 def write_cache_store(input_lengths: torch.Tensor, prefix_lengths: torch.Tensor, kv_cache_block_id_host: torch.Tensor, cache_store_member: librtp_compute_ops.PyCacheStoreInputs | None, kv_cache: librtp_compute_ops.KVCache | None) -> None:
     """
     WriteCacheStoreOp kernel
+    """
+def apply_rope_pos_ids_cos_sin_cache(q: torch.Tensor, k: torch.Tensor, q_rope: torch.Tensor, k_rope: torch.Tensor,
+                                     cos_sin_cache: torch.Tensor, pos_ids: torch.Tensor, interleave: bool = False,
+                                     cuda_stream: int = 0) -> None:
+    """
+    Applies RoPE to queries and keys using precomputed cosine/sine cache and position IDs
+    """
+def append_paged_mla_kv_cache(append_ckv: torch.Tensor, append_kpe: torch.Tensor, batch_indices: torch.Tensor,
+                              positions: torch.Tensor, ckv_cache: torch.Tensor, kpe_cache: torch.Tensor,
+                              kv_indices: torch.Tensor, kv_indptr: torch.Tensor, kv_last_page_len: torch.Tensor,
+                              cuda_stream: int = 0) -> None:
+    """
+    Appends new key-value entries to a paged KV cache with MLA support
     """

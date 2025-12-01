@@ -19,6 +19,7 @@ if device_type == DeviceType.ROCm:
     import rtp_llm.models_py.modules.rocm_registry  # isort:skip
     from rtp_llm.models_py.modules.rocm.fmha import DECODE_MHA_IMPS  # isort:skip
     from rtp_llm.models_py.modules.rocm.fmha import PREFILL_MHA_IMPS  # isort:skip
+    from rtp_llm.models_py.modules.rocm.mla_attention import DECODE_MLA_IMPS, PREFILL_MLA_IMPS
 
 else:
     from rtp_llm.models_py.modules.norm import FusedQKRMSNorm, RMSNorm
@@ -29,6 +30,7 @@ else:
         DECODE_MHA_IMPS,
         PREFILL_MHA_IMPS,
     )
+    from rtp_llm.models_py.modules.mla import DECODE_MLA_IMPS, PREFILL_MLA_IMPS
     import rtp_llm.models_py.modules.cuda_registry
 
 from rtp_llm.models_py.modules.embedding import Embedding
