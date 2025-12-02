@@ -249,7 +249,7 @@ hipError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv,
     return hipSuccess;
 }
 
-void append_paged_mla_kv_cache(at::Tensor append_ckv,
+inline void append_paged_mla_kv_cache(at::Tensor append_ckv,
                                at::Tensor append_kpe,
                                at::Tensor batch_indices,
                                at::Tensor positions,

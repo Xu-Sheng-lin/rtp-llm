@@ -301,7 +301,7 @@ hipError_t BatchQKApplyRotaryPosIdsCosSinCache(DType*      q,
     return hipSuccess;
 }
 
-void apply_rope_pos_ids_cos_sin_cache(at::Tensor q,
+inline void apply_rope_pos_ids_cos_sin_cache(at::Tensor q,
                                       at::Tensor k,
                                       at::Tensor q_rope,
                                       at::Tensor k_rope,
