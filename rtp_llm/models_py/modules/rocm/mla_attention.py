@@ -13,11 +13,6 @@ from rtp_llm.ops.compute_ops import (
     rtp_llm_ops
 )
 
-from librtp_compute_ops.rtp_llm_ops import (
-    apply_rope_pos_ids_cos_sin_cache,
-    append_paged_mla_kv_cache
-)
-
 from aiter.mla import (
     mla_decode_fwd,
     mla_prefill_fwd
@@ -171,7 +166,7 @@ class AiterMlaRotaryEmbeddingOp:
         rope_params: Any,
         kv_cache: Optional[KVCache] = None,
     ):
-        apply_rope_pos_ids_cos_sin_cache(
+        rtp_llm_ops.apply_rope_pos_ids_cos_sin_cache(
             q=query,
             k=key.unsqueeze(1),
             q_rope=query,
@@ -186,7 +181,7 @@ class AiterMlaRotaryEmbeddingOp:
                 kv_cache.k_cache_base, [self.kv_lora_rank, self.rope_head_dim], dim=-1
             )
 
-            append_paged_mla_kv_cache(
+            rtp_llm_ops.append_paged_mla_kv_cache(
                 append_ckv_t,
                 key,
                 rope_params.batch_indice,
