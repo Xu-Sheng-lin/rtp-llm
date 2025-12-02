@@ -117,7 +117,8 @@ std::shared_ptr<GenerateInput> QueryConverter::transQuery(const GenerateInputPB*
                                    mm_preprocess_config->max_pixels(),
                                    mm_preprocess_config->fps(),
                                    mm_preprocess_config->min_frames(),
-                                   mm_preprocess_config->max_frames());
+                                   mm_preprocess_config->max_frames(),
+                                   mm_preprocess_config->mm_timeout_ms());
         }
         generate_input->multimodal_inputs = std::move(mm_inputs);
     }
@@ -148,7 +149,10 @@ std::vector<MultimodalInput> QueryConverter::transMMInput(const MultimodalInputs
                                 mm_preprocess_config->height(),
                                 mm_preprocess_config->min_pixels(),
                                 mm_preprocess_config->max_pixels(),
-                                mm_preprocess_config->fps());
+                                mm_preprocess_config->fps(),
+                                mm_preprocess_config->min_frames(),
+                                mm_preprocess_config->max_frames(),
+                                mm_preprocess_config->mm_timeout_ms());
     }
     return inputs_vec;
 }
@@ -171,6 +175,9 @@ void QueryConverter::transMMPreprocessConfig(MMPreprocessConfigPB* config_pb, co
     config_pb->set_min_pixels(config.min_pixels);
     config_pb->set_max_pixels(config.max_pixels);
     config_pb->set_fps(config.fps);
+    config_pb->set_min_frames(config.min_frames);
+    config_pb->set_max_frames(config.max_frames);
+    config_pb->set_mm_timeout_ms(config.mm_timeout_ms);
 }
 
 MultimodalOutput QueryConverter::transMMOutput(const MultimodalOutputsPB* outputs_pb) {
@@ -183,6 +190,12 @@ MultimodalOutput QueryConverter::transMMOutput(const MultimodalOutputsPB* output
                 mm_output.mm_position_ids = std::vector<torch::Tensor>();
             }
             mm_output.mm_position_ids.value().emplace_back(transTensor(output_pb.multimodal_pos_id()));
+        }
+        if (output_pb.has_multimodal_deepstack_embeds()) {
+            if (mm_output.mm_deepstack_embeds == std::nullopt) {
+                mm_output.mm_deepstack_embeds = std::vector<torch::Tensor>();
+            }
+            mm_output.mm_deepstack_embeds.value().emplace_back(transTensor(output_pb.multimodal_deepstack_embeds()));
         }
     }
     return mm_output;

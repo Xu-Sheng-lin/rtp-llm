@@ -19,7 +19,7 @@ grpc::Status LocalRpcServer::init(const EngineInitParams&                       
     maga_init_params_ = maga_init_params;
     metrics_reporter_ = maga_init_params.metrics_reporter;
     RTP_LLM_LOG_INFO("LocalRpcServer aux_string %s",
-                        maga_init_params_.gpt_init_parameter.misc_config.aux_string.c_str());
+                     maga_init_params_.gpt_init_parameter.misc_config.aux_string.c_str());
     if (propose_params) {
         propose_maga_init_params_ = propose_params.get();
         if (!mm_process_engine.is_none()) {
@@ -43,17 +43,11 @@ grpc::Status LocalRpcServer::init(const EngineInitParams&                       
                                     "running engine init with gil held may cause program hang, please check");
             engine_.reset(new NormalEngine(maga_init_params));
         }
-        if (!mm_process_engine.is_none()) {
-            auto vit_separation = maga_init_params.gpt_init_parameter.vit_separation_;
-            if (vit_separation == 2) {
-                mm_processor_.reset(
-                    new RemoteMultimodalProcessor(mm_process_engine, maga_init_params.gpt_init_parameter));
-            } else if (vit_separation == 0) {
-                mm_processor_.reset(
-                    new LocalMultimodalProcessor(mm_process_engine, maga_init_params.gpt_init_parameter));
-            } else {
-                return grpc::Status(grpc::StatusCode::INTERNAL, "invalid vit separation value in config");
-            }
+        auto vit_separation = maga_init_params.gpt_init_parameter.vit_separation_;
+        if (vit_separation == 2) {
+            mm_processor_.reset(new RemoteMultimodalProcessor(maga_init_params.gpt_init_parameter));
+        } else if (vit_separation == 0) {
+            mm_processor_.reset(new LocalMultimodalProcessor(mm_process_engine, maga_init_params.gpt_init_parameter));
         }
     }
 
