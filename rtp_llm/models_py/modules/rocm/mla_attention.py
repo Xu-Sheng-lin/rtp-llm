@@ -36,8 +36,8 @@ class MlaParams(ParamsBase):
 class AiterMlaPrefillOp:
     def __init__(self, config: GptInitModelParameters):
         self.head_num = config.head_num
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.nope_head_dim
+        self.qk_rope_head_dim = config.rope_head_dim
 
     def support(self, attn_inputs: PyAttentionInputs) -> bool:
         return True
