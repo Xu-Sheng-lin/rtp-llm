@@ -179,8 +179,8 @@ class AiterMlaPrefillOp:
 class AiterMlaDecodeOp:
     def __init__(self, config: GptInitModelParameters):
         self.head_num = config.head_num
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.nope_head_dim
+        self.qk_rope_head_dim = config.rope_head_dim
 
         self.kv_cache_data_type = config.kv_cache_data_type
         self.use_asm_pa = config.hw_kernel_config.use_asm_pa
