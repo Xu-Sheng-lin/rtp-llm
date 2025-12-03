@@ -28,6 +28,108 @@ class MlaParams(ParamsBase):
         self.max_seq_len = input_lengths.max().item()
         self.batch_size = input_lengths.size(0)
 
+def rocm_fill_mla_params(
+        t_prefix_lengths: torch.Tensor,
+        t_sequence_lengths: torch.Tensor,
+        t_input_lengths: torch.Tensor,
+        t_kv_cache_block_id_host: torch.Tensor,
+        seq_size_per_block: int
+) -> MlaParams:
+    params = MlaParams(t_input_lengths)
+    device = t_input_lengths.device
+
+    def to_cpu(tensor):
+        return tensor.cpu().numpy() if tensor is not None else None
+
+    sequence_lengths = to_cpu(t_sequence_lengths)
+    input_lengths = to_cpu(t_input_lengths)
+    prefix_lengths = to_cpu(t_prefix_lengths) if t_prefix_lengths.numel() > 0 else None
+    kv_cache_block_id = to_cpu(t_kv_cache_block_id_host) if t_kv_cache_block_id_host.numel() > 0 else None
+
+    batch_size = input_lengths.shape[0]
+    max_batch_blocks = kv_cache_block_id.shape[1] if kv_cache_block_id is not None else -1
+
+    batch_indice = []
+    positions = []
+    paged_kv_last_page_len = []
+    kvlen = []
+    page_indice = []
+    reuse_cache_page_indice = []
+    decode_page_indptr = [0]
+    prefill_page_indptr = [0]
+    qo_indptr = [0]
+    batch_reuse_info_vec = []
+
+    total_page_idx = 0
+    accu_q_len = 0
+    accu_kv_len = 0
+    batch_start_idx = 0
+
+    for i in range(batch_size):
+        if prefix_lengths is not None: # prefill
+            input_length = input_lengths[i]
+            prefix_length = prefix_lengths[i]
+
+            batch_indice.extend([i] * input_length)
+            positions.extend([j + prefix_length for j in range(input_length)])
+
+            seq_len = input_length + prefix_length
+            accu_q_len += input_length
+            accu_kv_len += seq_len
+
+            page_num = (prefix_length + seq_size_per_block - 1) // seq_size_per_block
+            if kv_cache_block_id is not None:
+                reuse_cache_page_indice.extend(
+                    [kv_cache_block_id[i * max_batch_blocks + j] for j in range(page_num)]
+                )
+
+            if prefix_length > 0:
+                batch_reuse_info_vec.append([i, prefix_length, batch_start_idx, page_num])
+                batch_start_idx += page_num
+            else:
+                batch_reuse_info_vec.append([i, 0, 0, 0])
+        else: # decode
+            batch_indice.append(i)
+            positions.append(sequence_lengths[i])
+            seq_len = sequence_lengths[i] + 1
+            accu_q_len += 1
+            accu_kv_len += 1
+
+        last_page_len = (seq_len - 1) % seq_size_per_block + 1
+        paged_kv_last_page_len.append(last_page_len)
+        kvlen.append(seq_len)
+
+        page_num = (seq_len + seq_size_per_block - 1) // seq_size_per_block
+        if kv_cache_block_id is not None:
+            page_indice.extend([kv_cache_block_id[i * max_batch_blocks + j] for j in range(page_num)])
+            total_page_idx += page_num
+
+        decode_page_indptr.append(total_page_idx)
+        prefill_page_indptr.append(accu_kv_len)
+        qo_indptr.append(accu_q_len)
+
+    def to_hip_tensor(data, dtype=torch.int32):
+        return torch.tensor(data, dtype=dtype, device=device)
+
+    params.batch_indice = to_hip_tensor(batch_indice)
+    params.page_indice = to_hip_tensor(page_indice)
+    params.reuse_cache_page_indice = to_hip_tensor(reuse_cache_page_indice)
+    params.decode_page_indptr = to_hip_tensor(decode_page_indptr)
+    params.prefill_page_indptr = to_hip_tensor(prefill_page_indptr)
+    params.paged_kv_last_page_len = to_hip_tensor(paged_kv_last_page_len)
+    params.qo_indptr = to_hip_tensor(qo_indptr)
+    params.kvlen = to_hip_tensor(kvlen)
+    params.positions = to_hip_tensor(positions)
+
+    if len(reuse_cache_page_indice) > 0:
+        flat_info = [elem for sublist in batch_reuse_info_vec for elem in sublist]
+        params.batch_reuse_info_vec = to_hip_tensor(flat_info).view(
+            len(batch_reuse_info_vec),
+            len(batch_reuse_info_vec[0])
+        )
+
+    return params
+
 class AiterMlaPrefillOp:
     def __init__(self, config: GptInitModelParameters):
         self.head_num = config.head_num
@@ -150,7 +252,7 @@ class AiterMlaRotaryEmbeddingOp:
 
     def prepare(self, attention_inputs: PyAttentionInputs):
         check_attention_inputs(attention_inputs)
-        return rtp_llm_ops.fill_mla_params(
+        return rocm_fill_mla_params(
             attention_inputs.prefix_lengths,
             attention_inputs.sequence_lengths,
             attention_inputs.input_lengths,
