@@ -1,7 +1,8 @@
 #pragma once
 #include <string>
 #include <sstream>
-
+#include <vector>
+#include <map>
 namespace rtp_llm {
 
 struct ParallelismDistributedConfig {
@@ -13,6 +14,7 @@ struct ParallelismDistributedConfig {
     int         world_rank       = 0;
     int         local_world_size = 1;
     int         ffn_sp_size      = 1;
+    bool        use_all_gather   = true;
     std::string to_string() const;
     void        update_from_env_for_test();
 };
@@ -97,8 +99,14 @@ struct HWKernelConfig {
     bool        use_asm_pa                   = true;
     bool        enable_native_cuda_graph     = false;
     int         num_native_cuda_graph        = 200;
-    std::string to_string() const;
-    void        update_from_env_for_test();
+    // Prefill CUDA Graph capture configuration
+    // Can be set via: prefill_capture_file_path, prefill_capture_seq_lens, or prefill_capture_max_seq_len + step
+    std::vector<int> prefill_capture_seq_lens;
+    // Decode CUDA Graph capture configuration
+    // Comma-separated list of batch sizes, e.g., "1,2,4,8,16,32"
+    std::vector<int> decode_capture_batch_sizes;
+    std::string      to_string() const;
+    void             update_from_env_for_test();
 };
 
 struct DeviceResourceConfig {
@@ -341,6 +349,22 @@ struct ArpcConfig {
     int         queueNum    = 50;
     int         ioThreadNum = 2;
     std::string to_string() const;
+};
+
+struct GrpcConfig {
+    std::map<std::string, int> client_config;
+    std::map<std::string, int> server_config;
+    GrpcConfig() {};
+    GrpcConfig(const std::string& json_str);
+    std::string                to_string() const;
+    void                       update_from_env_for_test();
+    void                       from_json(const std::string& json_str);
+    std::map<std::string, int> get_client_config() const {
+        return client_config;
+    }
+    std::map<std::string, int> get_server_config() const {
+        return server_config;
+    }
 };
 
 std::string to_lower(const std::string& s);

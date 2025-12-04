@@ -26,7 +26,7 @@ void registerFMHAType(py::module m) {
 
 void register_parallelism_distributed_config(pybind11::module& m) {
     pybind11::class_<ParallelismDistributedConfig>(m, "ParallelismDistributedConfig")
-        .def(pybind11::init<int, int, int, int, int, int, int, int>(),
+        .def(pybind11::init<int, int, int, int, int, int, int, int, bool>(),
              pybind11::arg("tp_size")          = 1,
              pybind11::arg("ep_size")          = 1,
              pybind11::arg("dp_size")          = 1,
@@ -34,7 +34,8 @@ void register_parallelism_distributed_config(pybind11::module& m) {
              pybind11::arg("world_size")       = 1,
              pybind11::arg("world_rank")       = 0,
              pybind11::arg("local_world_size") = 1,
-             pybind11::arg("ffn_sp_size")      = 1)
+             pybind11::arg("ffn_sp_size")      = 1,
+             pybind11::arg("use_all_gather")   = true)
         .def("to_string", &ParallelismDistributedConfig::to_string)
         .def("update_from_env", &ParallelismDistributedConfig::update_from_env_for_test)
         .def_readwrite("tp_size", &ParallelismDistributedConfig::tp_size)
@@ -44,7 +45,8 @@ void register_parallelism_distributed_config(pybind11::module& m) {
         .def_readwrite("world_size", &ParallelismDistributedConfig::world_size)
         .def_readwrite("world_rank", &ParallelismDistributedConfig::world_rank)
         .def_readwrite("local_world_size", &ParallelismDistributedConfig::local_world_size)
-        .def_readwrite("ffn_sp_size", &ParallelismDistributedConfig::ffn_sp_size);
+        .def_readwrite("ffn_sp_size", &ParallelismDistributedConfig::ffn_sp_size)
+        .def_readwrite("use_all_gather", &ParallelismDistributedConfig::use_all_gather);
 }
 
 void register_arpc_config(pybind11::module& m) {
@@ -57,6 +59,18 @@ void register_arpc_config(pybind11::module& m) {
         .def_readwrite("threadNum", &ArpcConfig::threadNum)
         .def_readwrite("queueNum", &ArpcConfig::queueNum)
         .def_readwrite("ioThreadNum", &ArpcConfig::ioThreadNum);
+}
+
+void register_grpc_config(pybind11::module& m) {
+    pybind11::class_<GrpcConfig>(m, "GrpcConfig")
+        .def(pybind11::init<>())  // Default constructor
+        .def(pybind11::init<const std::string&>(),
+             pybind11::arg("json_str"))  // JSON string constructor
+        .def("to_string", &GrpcConfig::to_string)
+        .def("update_from_env", &GrpcConfig::update_from_env_for_test)
+        .def("from_json", &GrpcConfig::from_json, "Initialize from JSON string")
+        .def("get_client_config", &GrpcConfig::get_client_config)
+        .def("get_server_config", &GrpcConfig::get_server_config);
 }
 
 void register_ffn_disaggregate_config(pybind11::module& m) {
@@ -222,7 +236,21 @@ void register_profiling_debug_logging_config(pybind11::module& m) {
 
 void register_hwkernel_config(pybind11::module& m) {
     pybind11::class_<HWKernelConfig>(m, "HWKernelConfig")
-        .def(pybind11::init<int, bool, bool, bool, bool, std::string, bool, bool, bool, bool, bool, bool, int>(),
+        .def(pybind11::init<int,
+                            bool,
+                            bool,
+                            bool,
+                            bool,
+                            std::string,
+                            bool,
+                            bool,
+                            bool,
+                            bool,
+                            bool,
+                            bool,
+                            int,
+                            std::vector<int>,
+                            std::vector<int>>(),
              pybind11::arg("deep_gemm_num_sm")             = -1,
              pybind11::arg("arm_gemm_use_kai")             = false,
              pybind11::arg("enable_stable_scatter_add")    = false,
@@ -235,7 +263,9 @@ void register_hwkernel_config(pybind11::module& m) {
              pybind11::arg("use_aiter_pa")                 = true,
              pybind11::arg("use_asm_pa")                   = true,
              pybind11::arg("enable_native_cuda_graph")     = false,
-             pybind11::arg("num_native_cuda_graph")        = 200)
+             pybind11::arg("num_native_cuda_graph")        = 200,
+             pybind11::arg("prefill_capture_seq_lens")     = std::vector<int>(),
+             pybind11::arg("decode_capture_batch_sizes")   = std::vector<int>())
         .def("to_string", &HWKernelConfig::to_string)
         .def("update_from_env", &HWKernelConfig::update_from_env_for_test)
         .def_readwrite("deep_gemm_num_sm", &HWKernelConfig::deep_gemm_num_sm)
@@ -250,7 +280,9 @@ void register_hwkernel_config(pybind11::module& m) {
         .def_readwrite("use_aiter_pa", &HWKernelConfig::use_aiter_pa)
         .def_readwrite("use_asm_pa", &HWKernelConfig::use_asm_pa)
         .def_readwrite("enable_native_cuda_graph", &HWKernelConfig::enable_native_cuda_graph)
-        .def_readwrite("num_native_cuda_graph", &HWKernelConfig::num_native_cuda_graph);
+        .def_readwrite("num_native_cuda_graph", &HWKernelConfig::num_native_cuda_graph)
+        .def_readwrite("prefill_capture_seq_lens", &HWKernelConfig::prefill_capture_seq_lens)
+        .def_readwrite("decode_capture_batch_sizes", &HWKernelConfig::decode_capture_batch_sizes);
 }
 
 // DeviceResourceConfig
@@ -647,6 +679,7 @@ void registerGptInitParameter(py::module m) {
     DEF_PROPERTY(dp_tp_nccl_port, dp_tp_nccl_port_)                                                                    \
     DEF_PROPERTY(ffn_tp_nccl_port, ffn_tp_nccl_port_)                                                                  \
     DEF_PROPERTY(model_rpc_port, model_rpc_port_)                                                                      \
+    DEF_PROPERTY(embedding_rpc_port, embedding_rpc_port_)                                                              \
     DEF_PROPERTY(http_port, http_port_)                                                                                \
     DEF_PROPERTY(tp_size, tp_size_)                                                                                    \
     DEF_PROPERTY(tp_rank, tp_rank_)                                                                                    \
@@ -755,6 +788,7 @@ void registerGptInitParameter(py::module m) {
         .def_readwrite("fifo_scheduler_config", &GptInitParameter::fifo_scheduler_config)
         .def_readwrite("misc_config", &GptInitParameter::misc_config)
         .def_readwrite("arpc_config", &GptInitParameter::arpc_config)
+        .def_readwrite("grpc_config", &GptInitParameter::grpc_config)
         .def_readwrite("ffn_disaggregate_config", &GptInitParameter::ffn_disaggregate_config) REGISTER_PROPERTYS;
 }
 
@@ -777,6 +811,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
     register_fifo_scheduler_config(m);
     register_misc_config(m);
     register_arpc_config(m);
+    register_grpc_config(m);
     registerFMHAType(m);
     register_ffn_disaggregate_config(m);
     registerGptInitParameter(m);

@@ -13,16 +13,17 @@ import torch.nn.functional as F
 # sys.path.append(os.path.join(str(CUR_PATH), "../../../"))
 device = torch.device(f"cuda")
 
+import flashinfer.page as page
+
 from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
 from rtp_llm.models.rotary_embedding.deepseek_rotary_embedding import (
     DeepseekV3YarnRotaryEmbedding,
 )
-from rtp_llm.models_py.modules.linear_factory import LinearFactory
-from rtp_llm.models_py.modules.mla.flashinfer_mla import flashinfer_python
-from rtp_llm.models_py.modules.mla.flashinfer_mla_wrapper import (
+from rtp_llm.models_py.modules.common.mla.mla_attention_ref import attention_ref
+from rtp_llm.models_py.modules.cuda.mla.flashinfer_mla_wrapper import (
     MlaFlashInferPrefillImpl,
 )
-from rtp_llm.models_py.modules.mla.mla_attention_ref import attention_ref
+from rtp_llm.models_py.modules.linear_factory import LinearFactory
 from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs
 from rtp_llm.utils.model_weight import W
 
@@ -184,8 +185,7 @@ class MLATest(TestCase):
             [self.config.kv_lora_rank, self.config.rope_head_dim],
             dim=-1,
         )
-
-        flashinfer_python.page.append_paged_mla_kv_cache(
+        page.append_paged_mla_kv_cache(
             compressed_kv,
             k_pe,
             fmha_impl.rope_params.batch_indice,

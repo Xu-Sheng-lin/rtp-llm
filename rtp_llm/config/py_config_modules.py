@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Optional
+from typing import List, Optional
 
 from rtp_llm.ops import (
     ConcurrencyConfig,
@@ -8,6 +8,7 @@ from rtp_llm.ops import (
     FMHAConfig,
     MiscellaneousConfig,
     ModelSpecificConfig,
+    MoeConfig,
     ParallelismDistributedConfig,
     ProfilingDebugLoggingConfig,
     RoleType,
@@ -17,7 +18,7 @@ from rtp_llm.utils.weight_type import WEIGHT_TYPE
 
 DEFAULT_START_PORT = 8088
 MASTER_INFO_PORT_NUM = 11
-MIN_WORKER_INFO_PORT_NUM = 7
+MIN_WORKER_INFO_PORT_NUM = 8
 WORKER_INFO_PORT_NUM = MIN_WORKER_INFO_PORT_NUM
 
 
@@ -36,6 +37,17 @@ def get_env_bool(name: str, default: bool = False):
     v = os.environ.get(name, None)
     if v is None or v == "":
         return default
+    return v.lower() == "1" or v.lower() == "on" or v.lower() == "true"
+
+
+def get_env_optional_bool(name: str):
+    """
+    Get optional bool from environment variable.
+    Returns None if environment variable is not set, otherwise returns bool value.
+    """
+    v = os.environ.get(name, None)
+    if v is None or v == "":
+        return None
     return v.lower() == "1" or v.lower() == "on" or v.lower() == "true"
 
 
@@ -758,6 +770,9 @@ class PyHwKernelConfig:
         self.use_asm_pa: bool = True
         self.enable_native_cuda_graph: bool = False
         self.num_native_cuda_graph: int = 200
+        self.prefill_capture_seq_lens: List[int] = []
+        self.prefill_capture_config: str = ""
+        self.decode_capture_config: str = ""
 
     def update_from_env(self):
         self.deep_gemm_num_sm = get_env_int("DEEP_GEMM_NUM_SM", self.deep_gemm_num_sm)
@@ -789,6 +804,12 @@ class PyHwKernelConfig:
         self.num_native_cuda_graph = get_env_int(
             "NUM_NATIVE_CUDA_GRAPH", self.num_native_cuda_graph
         )
+        self.prefill_capture_config = get_env_str(
+            "PREFILL_CAPTURE_CONFIG", self.prefill_capture_config
+        )
+        self.decode_capture_config = get_env_str(
+            "DECODE_CAPTURE_CONFIG", self.decode_capture_config
+        )
 
     def to_string(self):
         return (
@@ -804,7 +825,10 @@ class PyHwKernelConfig:
             f"use_aiter_pa: {self.use_aiter_pa}\n"
             f"use_asm_pa: {self.use_asm_pa}\n"
             f"enable_native_cuda_graph: {self.enable_native_cuda_graph}\n"
-            f"num_native_cuda_graph: {self.num_native_cuda_graph}"
+            f"num_native_cuda_graph: {self.num_native_cuda_graph}\n"
+            f"prefill_capture_seq_lens: {self.prefill_capture_seq_lens}\n"
+            f"prefill_capture_config: {self.prefill_capture_config}\n"
+            f"decode_capture_config: {self.decode_capture_config}"
         )
 
 
@@ -844,6 +868,7 @@ class PyEnvConfigs:
         self.fmha_config = FMHAConfig()
         self.misc_config = MiscellaneousConfig()
         self.concurrency_config = ConcurrencyConfig()
+        self.moe_config = MoeConfig()
         self.jit_config = JITConfig()
         self.py_hw_kernel_config = PyHwKernelConfig()
 
@@ -874,10 +899,30 @@ class PyEnvConfigs:
         self.fmha_config.update_from_env()
         self.misc_config.update_from_env()
         self.concurrency_config.update_from_env()
+        self.moe_config.update_from_env()
         self.ffn_disaggregate_config.update_from_env()
         self.jit_config.update_from_env()
         self.py_hw_kernel_config.update_from_env()
         logging.info(self.to_string())
+
+    def should_auto_configure_deepep(self) -> bool:
+        """
+        Check if DeepEP should be auto-configured.
+        Returns True if environment variables are not set (None), meaning user hasn't manually configured.
+        Returns False if user has manually set any of the DeepEP environment variables.
+        """
+        use_deepep_moe_env = get_env_optional_bool("USE_DEEPEP_MOE")
+        use_deepep_internode_env = get_env_optional_bool("USE_DEEPEP_INTERNODE")
+        use_deepep_low_latency_env = get_env_optional_bool("USE_DEEPEP_LOW_LATENCY")
+
+        # Check if all environment variables are None (not set)
+        # If all are None, we should auto-configure
+        # If any is not None, user has manually configured, so we shouldn't auto-configure
+        return (
+            use_deepep_moe_env is None
+            and use_deepep_internode_env is None
+            and use_deepep_low_latency_env is None
+        )
 
     def to_string(self):
         return (
@@ -916,6 +961,7 @@ class PyEnvConfigs:
             "[fmha_config]\n" + self.fmha_config.to_string() + "\n\n"
             "[misc_config]\n" + self.misc_config.to_string() + "\n\n"
             "[concurrency_config]\n" + self.concurrency_config.to_string() + "\n\n"
+            "[moe_config]\n" + self.moe_config.to_string() + "\n\n"
             "[jit_config]\n" + self.jit_config.to_string() + "\n\n"
             "[py_hw_kernel_config]\n" + self.py_hw_kernel_config.to_string() + "\n\n"
         )

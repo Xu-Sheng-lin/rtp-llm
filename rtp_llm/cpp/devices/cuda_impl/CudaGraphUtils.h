@@ -3,6 +3,7 @@
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/models_py/bindings/OpDefs.h"
 #include "rtp_llm/cpp/devices/cuda_impl/CudaFlashInfer.h"
+#include "rtp_llm/cpp/cuda/cuda_host_utils.h"
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAGraph.h>
 using namespace torch_ext;
@@ -28,7 +29,10 @@ public:
         py_model_inputs_.attention_inputs.is_prefill               = is_embedding;
         py_model_inputs_.attention_inputs.dtype                    = inputs.attention_inputs.dtype;
         py_model_inputs_.attention_inputs.kv_block_offset          = kv_cache_block_offset;
-        py_model_inputs_.bert_embedding_inputs                     = inputs.bert_embedding_inputs;
+        py_model_inputs_.attention_inputs.prefill_cuda_graph_copy_params =
+            inputs.attention_inputs.prefill_cuda_graph_copy_params;
+        py_model_inputs_.bert_embedding_inputs = inputs.bert_embedding_inputs;
+        py_model_inputs_.attention_inputs.is_s_padded              = inputs.attention_inputs.is_s_padded;
     }
 
 public:
@@ -48,26 +52,47 @@ public:
 
 class CudaGraphStreamLife {
 public:
-    // CudaDevice's `stream_` is torch default stream
-    CudaGraphStreamLife(at::cuda::CUDAStream capture_stream, rtp_llm::DeviceBase* device):
+    CudaGraphStreamLife(at::cuda::CUDAStream capture_stream):
         origin_stream_(at::cuda::getCurrentCUDAStream(at::cuda::current_device())) {
-        cuda_device_ = dynamic_cast<rtp_llm::CudaDevice*>(device);
         // Set `capture_stream` for capture. All kernels should use this stream while capturing.
-        origin_cuda_device_stream_ = cuda_device_->getStream();
-        cuda_device_->setStream(capture_stream.stream());
-        RTP_LLM_LOG_INFO("Set Cuda Stream: capture_stream -> %d, set_stream -> %d, origin_cuda_device_stream_-> %d",
-                         capture_stream.stream(),
-                         reinterpret_cast<int64_t>(cuda_device_->getStream()),
-                         origin_cuda_device_stream_);
         at::cuda::setCurrentCUDAStream(capture_stream);
+        RTP_LLM_LOG_INFO("Set Cuda Stream: capture_stream -> %d, origin_stream -> %d",
+                         capture_stream.stream(),
+                         origin_stream_.stream());
     }
     ~CudaGraphStreamLife() {
         at::cuda::setCurrentCUDAStream(origin_stream_);
-        cuda_device_->setStream(origin_cuda_device_stream_);
     }
 
 private:
     at::cuda::CUDAStream origin_stream_;
-    cudaStream_t         origin_cuda_device_stream_;
-    rtp_llm::CudaDevice* cuda_device_;
+};
+
+// RAII guard for CUDA graph capture state
+class CudaGraphCaptureGuard {
+public:
+    CudaGraphCaptureGuard() {
+        rtp_llm::CaptureCheck::in_cuda_graph_capture = true;
+    }
+
+    ~CudaGraphCaptureGuard() {
+        rtp_llm::CaptureCheck::in_cuda_graph_capture = false;
+    }
+
+    // Non-copyable, non-movable
+    CudaGraphCaptureGuard(const CudaGraphCaptureGuard&)            = delete;
+    CudaGraphCaptureGuard& operator=(const CudaGraphCaptureGuard&) = delete;
+    CudaGraphCaptureGuard(CudaGraphCaptureGuard&&)                 = delete;
+    CudaGraphCaptureGuard& operator=(CudaGraphCaptureGuard&&)      = delete;
+};
+
+// Current state of CUDA graph execution
+struct CudaGraphState {
+    int current_batch_size{1};
+    int current_seq_len{1};
+    // for decode
+    int current_real_graph_bs{1};
+    // for prefill
+    int current_real_graph_seq_len{1};
+    int seq_len_sum{0};
 };

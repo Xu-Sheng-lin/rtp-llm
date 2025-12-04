@@ -16,12 +16,12 @@ from rtp_llm.models.rotary_embedding.deepseek_rotary_embedding import (
     DeepseekV3YarnRotaryEmbedding,
 )
 
-from rtp_llm.models_py.modules.mla import MlaAttention
+from rtp_llm.models_py.modules.common.mla.mla_attention import MlaAttention
+from rtp_llm.models_py.modules.common.mla.mla_attention_ref import MlaAttentionRef
 from rtp_llm.models_py.modules.rocm.mla.mla_attention_ops import (
     AiterMlaPrefillImpl
 )
 
-from rtp_llm.models_py.modules.mla.mla_attention_ref import MlaAttentionRef
 from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs
 from rtp_llm.utils.model_weight import W
 

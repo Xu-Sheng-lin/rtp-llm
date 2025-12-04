@@ -16,6 +16,7 @@ from rtp_llm.config.py_config_modules import (
     StaticConfig,
     get_env_bool,
     get_env_int,
+    get_env_optional_bool,
     get_env_str,
 )
 from rtp_llm.config.quant_config import (
@@ -45,6 +46,7 @@ from rtp_llm.ops import (
     FIFOSchedulerConfig,
     FMHAConfig,
     GptInitParameter,
+    GrpcConfig,
     HWKernelConfig,
     KVCacheConfig,
     MiscellaneousConfig,
@@ -303,6 +305,7 @@ class GptInitModelParameters:
     mm_sep_tokens: list[list[int]]
     model_name: str
     model_rpc_port: int
+    embedding_rpc_port: int
     moe_inter_padding_size: int
     moe_k: int
     moe_layer_index: list[int]
@@ -393,6 +396,7 @@ class GptInitModelParameters:
     kv_cache_config: KVCacheConfig
     misc_config: MiscellaneousConfig
     arpc_config: ArpcConfig
+    grpc_config: GrpcConfig
     model_specific_config: ModelSpecificConfig
     moe_config: MoeConfig
     parallelism_distributed_config: ParallelismDistributedConfig
@@ -444,6 +448,7 @@ class GptInitModelParameters:
         self.th_nccl_port = g_master_info.th_nccl_port
         self.ffn_tp_nccl_port = g_master_info.ffn_tp_nccl_port
         self.model_rpc_port = g_worker_info.rpc_server_port
+        self.embedding_rpc_port = g_worker_info.embedding_rpc_server_port
         self.http_port = g_worker_info.http_port
         self.cache_store_listen_port = g_worker_info.cache_store_listen_port
         self.cache_store_connect_port = g_worker_info.cache_store_connect_port
@@ -472,9 +477,10 @@ class GptInitModelParameters:
         # For cpp, we use `gpt_init_params`, `py_env_configs` for python.
         # There are some common envs in cpp and python, so they will
         # share some configs together.
-        self.update_gpt_init_params_from_env()
+        # Initialize py_env_configs first so it can be used in update_gpt_init_params_from_env()
         self.py_env_configs = PyEnvConfigs()
         self.py_env_configs.update_from_env()
+        self.update_gpt_init_params_from_env()
         self.py_env_configs.parallelism_distributed_config = (
             self.gpt_init_params.parallelism_distributed_config
         )
@@ -532,11 +538,194 @@ class GptInitModelParameters:
         self.worker_grpc_addrs = worker_grpc_addrs
         self.worker_addrs = worker_addrs
 
+    def _parse_comma_separated_ints(
+        self, config: str, config_name: str, item_name: str, raise_on_empty: bool = True
+    ) -> List[int]:
+        """
+        Parse comma-separated list of positive integers from config string.
+
+        Args:
+            config: Configuration string containing comma-separated integers
+            config_name: Name of the configuration (for error messages)
+            item_name: Name of the items being parsed (e.g., "sequence lengths", "batch sizes")
+            raise_on_empty: If True, raise ValueError when no valid items found; if False, return empty list
+
+        Returns:
+            List of positive integers parsed from the config string
+
+        Raises:
+            ValueError: If raise_on_empty=True and no valid items found, or if parsing fails
+        """
+        try:
+            values = [int(x.strip()) for x in config.split(",") if x.strip()]
+            values = [x for x in values if x > 0]
+            if values:
+                logging.info(
+                    f"Using {item_name} from comma-separated list: {len(values)} items"
+                )
+                return values
+            else:
+                # Extract base item name (last 2 words, e.g., "sequence lengths" from "prefill capture sequence lengths")
+                words = item_name.split()
+                base_item_name = (
+                    " ".join(words[-2:])
+                    if len(words) >= 2
+                    else words[-1] if words else item_name
+                )
+                error_msg = f"{config_name} contains no valid {base_item_name}"
+                if raise_on_empty:
+                    raise ValueError(error_msg)
+                else:
+                    logging.warning(f"{error_msg}, using default logic")
+                    return []
+        except ValueError as e:
+            # Check if the exception is from our own code (contains config_name)
+            if config_name in str(e):
+                # Re-raise our own exceptions as-is
+                if raise_on_empty:
+                    raise
+                else:
+                    logging.warning(f"{e}, using default logic")
+                    return []
+            else:
+                # For parsing errors (e.g., invalid int), use simpler message
+                words = item_name.split()
+                base_item_name = (
+                    " ".join(words[-2:])
+                    if len(words) >= 2
+                    else words[-1] if words else item_name
+                )
+                error_msg = f"{config_name} contains no valid {base_item_name}"
+                if raise_on_empty:
+                    raise ValueError(error_msg)
+                else:
+                    logging.warning(f"{error_msg}, using default logic")
+                    return []
+
+    def _generate_prefill_capture_seq_lens(self) -> List[int]:
+        """
+        Generate prefill capture sequence lengths from Python.
+        Supports three formats via prefill_capture_config:
+        1. File path: starts with 'file://' or '/', e.g., 'file:///path/to/seq_lens.txt' or '/path/to/seq_lens.txt'
+        2. Comma-separated list: e.g., '10,100,500,1000,2000'
+        3. Range: format 'max:step', e.g., '16384:128' (generates [128, 256, ..., 16384])
+
+        This function MUST return a non-empty list. If no configuration is provided,
+        it will raise an error.
+        """
+        # Get config from py_env_configs (which is populated from command line arguments)
+        config = self.py_env_configs.py_hw_kernel_config.prefill_capture_config
+        if not config:
+            raise ValueError(
+                "prefill_capture_config must be set. Supported formats:\n"
+                "  1. File path: 'file:///path/to/seq_lens.txt' or '/path/to/seq_lens.txt'\n"
+                "  2. Comma-separated list: '10,100,500,1000,2000'\n"
+                "  3. Range: '16384:128' (generates [128, 256, ..., 16384])"
+            )
+
+        config = config.strip()
+
+        # Mode 1: File path (starts with 'file://' or '/')
+        if config.startswith("file://") or config.startswith("/"):
+            file_path = config[7:] if config.startswith("file://") else config
+            try:
+                seq_lens = []
+                with open(file_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            try:
+                                seq_len = int(line)
+                                if seq_len > 0:
+                                    seq_lens.append(seq_len)
+                            except ValueError:
+                                logging.warning(
+                                    f"Invalid sequence length in file: {line}"
+                                )
+                if seq_lens:
+                    logging.info(
+                        f"Loaded {len(seq_lens)} sequence lengths from {file_path}"
+                    )
+                    return seq_lens
+                else:
+                    raise ValueError(
+                        f"No valid sequence lengths found in file: {file_path}"
+                    )
+            except FileNotFoundError:
+                raise FileNotFoundError(f"Prefill capture file not found: {file_path}")
+            except Exception as e:
+                raise RuntimeError(f"Error reading prefill capture file: {e}")
+
+        # Mode 3: Range format (max:step)
+        if ":" in config:
+            try:
+                parts = config.split(":")
+                if len(parts) != 2:
+                    raise ValueError("Range format must be 'max:step'")
+                max_seq_len = int(parts[0].strip())
+                step = int(parts[1].strip())
+                if max_seq_len <= 0 or step <= 0:
+                    raise ValueError("max_seq_len and step must be positive integers")
+                seq_lens = list(range(step, max_seq_len + 1, step))
+                if max_seq_len not in seq_lens:
+                    seq_lens.append(max_seq_len)
+                if seq_lens:
+                    logging.info(
+                        f"Generated {len(seq_lens)} sequence lengths from range (step={step}, max={max_seq_len})"
+                    )
+                    return seq_lens
+                else:
+                    raise ValueError(
+                        f"Invalid range parameters: max_seq_len={max_seq_len}, step={step}"
+                    )
+            except ValueError as e:
+                raise ValueError(f"Invalid range format '{config}': {e}")
+
+        # Mode 2: Comma-separated list (default)
+        return self._parse_comma_separated_ints(
+            config,
+            "prefill_capture_config",
+            "prefill capture sequence lengths",
+            raise_on_empty=True,
+        )
+
+    def _generate_decode_capture_batch_sizes(self) -> List[int]:
+        """
+        Generate decode capture batch sizes from Python.
+        Only supports comma-separated list format, e.g., '1,2,4,8,16,32'
+
+        Returns empty list if no configuration is provided (will use default logic).
+        """
+        # Get config from py_env_configs (which is populated from command line arguments)
+        config = self.py_env_configs.py_hw_kernel_config.decode_capture_config
+        if not config:
+            # Return empty list to use default logic
+            return []
+
+        config = config.strip()
+        if not config:
+            return []
+
+        # Only support comma-separated list format
+        return self._parse_comma_separated_ints(
+            config,
+            "decode_capture_config",
+            "decode capture batch sizes",
+            raise_on_empty=False,
+        )
+
     def update_gpt_init_params_from_env(
         self, parallel_info: ParallelInfo = g_parallel_info
     ):
 
         # ParallelismDistributedConfig
+        # USE_ALL_GATHER: Enable all-gather communication for pure TP (ep_size == tp_size).
+        # When enabled, DeepEP should not be used. Default is False.
+        # Calculate use_all_gather: (USE_ALL_GATHER env is True) and (ep_size == tp_size)
+        use_all_gather_env = get_env_bool("USE_ALL_GATHER", True)
+        use_all_gather = use_all_gather_env and (
+            parallel_info.ep_size == parallel_info.tp_size
+        )
         self.gpt_init_params.parallelism_distributed_config = (
             ParallelismDistributedConfig(
                 tp_size=parallel_info.tp_size,
@@ -547,6 +736,7 @@ class GptInitModelParameters:
                 local_world_size=parallel_info.local_world_size,
                 pp_size=parallel_info.pp_size,
                 ffn_sp_size=parallel_info.ffn_sp_size,
+                use_all_gather=use_all_gather,
             )
         )
 
@@ -646,6 +836,13 @@ class GptInitModelParameters:
             )
         )
         # HWKernelConfig
+        enable_cuda_graph = get_env_bool("ENABLE_CUDA_GRAPH", False)
+        # Generate prefill capture sequence lengths from Python only when CUDA Graph is enabled
+        prefill_capture_seq_lens = []
+        if enable_cuda_graph:
+            prefill_capture_seq_lens = self._generate_prefill_capture_seq_lens()
+        # Generate decode capture batch sizes from Python
+        decode_capture_batch_sizes = self._generate_decode_capture_batch_sizes()
         self.gpt_init_params.hw_kernel_config = HWKernelConfig(
             deep_gemm_num_sm=get_env_int("DEEP_GEMM_NUM_SM"),
             arm_gemm_use_kai=get_env_bool("ARM_GEMM_USE_KAI"),
@@ -656,7 +853,7 @@ class GptInitModelParameters:
             ),
             use_swizzleA=(get_env_bool("USE_SWIZZLEA", False)),
             ft_disable_custom_ar=get_env_bool("FT_DISABLE_CUSTOM_AR", True),
-            enable_cuda_graph=get_env_bool("ENABLE_CUDA_GRAPH", False),
+            enable_cuda_graph=enable_cuda_graph,
             enable_cuda_graph_debug_mode=get_env_bool(
                 "ENABLE_CUDA_GRAPH_DEBUG_MODE", False
             ),
@@ -664,6 +861,8 @@ class GptInitModelParameters:
             use_asm_pa=get_env_bool("USE_ASM_PA", True),
             enable_native_cuda_graph=get_env_bool("ENABLE_NATIVE_CUDA_GRAPH", False),
             num_native_cuda_graph=get_env_int("NUM_NATIVE_CUDA_GRAPH", 200),
+            prefill_capture_seq_lens=prefill_capture_seq_lens,
+            decode_capture_batch_sizes=decode_capture_batch_sizes,
         )
 
         # DeviceResourceConfig
@@ -683,10 +882,24 @@ class GptInitModelParameters:
         )
 
         # MoeConfig
+        use_deepep_moe_env = get_env_optional_bool("USE_DEEPEP_MOE")
+        use_deepep_internode_env = get_env_optional_bool("USE_DEEPEP_INTERNODE")
+        use_deepep_low_latency_env = get_env_optional_bool("USE_DEEPEP_LOW_LATENCY")
+
         self.gpt_init_params.moe_config = MoeConfig(
-            use_deepep_moe=get_env_bool("USE_DEEPEP_MOE", False),
-            use_deepep_internode=get_env_bool("USE_DEEPEP_INTERNODE", False),
-            use_deepep_low_latency=get_env_bool("USE_DEEPEP_LOW_LATENCY", True),
+            use_deepep_moe=(
+                use_deepep_moe_env if use_deepep_moe_env is not None else False
+            ),
+            use_deepep_internode=(
+                use_deepep_internode_env
+                if use_deepep_internode_env is not None
+                else False
+            ),
+            use_deepep_low_latency=(
+                use_deepep_low_latency_env
+                if use_deepep_low_latency_env is not None
+                else True
+            ),
             use_deepep_p2p_low_latency=get_env_bool(
                 "USE_DEEPEP_P2P_LOW_LATENCY", False
             ),
@@ -788,6 +1001,13 @@ class GptInitModelParameters:
             threadNum=get_env_int("ARPC_THREAD_NUM", 10),
             queueNum=get_env_int("ARPC_QUEUE_NUM", 50),
             ioThreadNum=get_env_int("ARPC_IO_THREAD_NUM", 2),
+        )
+
+        self.gpt_init_params.grpc_config = GrpcConfig(
+            get_env_str(
+                "GRPC_CONFIG_JSON",
+                '{"client_config": {"grpc.max_receive_message_length": 1073741824, "grpc.max_metadata_size": 1073741824}, "server_config": {"grpc.max_concurrent_streams": 100000, "grpc.max_connection_idle_ms": 600000, "grpc.http2.min_recv_ping_interval_without_data_ms": 1000, "grpc.http2.max_ping_strikes": 1000}',
+            )
         )
 
         # PD Seperation
@@ -940,7 +1160,7 @@ class GptInitModelParameters:
         self.local_rank = parallel_info.local_rank
         self.use_all_gather = (
             # default enable since it has better performance in most cases
-            bool(int(os.environ.get("USE_ALL_GATHER", 1)))
+            self.gpt_init_params.parallelism_distributed_config.use_all_gather
             and self.gpt_init_params.ep_size == self.gpt_init_params.tp_size
         )
         logging.info(f"use_all_gather: {self.use_all_gather}")

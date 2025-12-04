@@ -14,7 +14,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <algorithm>
-
+#include "rtp_llm/cpp/devices/utils/DebugUtils.h"
 using namespace std;
 using namespace at::indexing;
 

@@ -6,9 +6,9 @@ void CudaGraphPrefillOp::init(py::object py_instance) {
     cuda_graph_runner_ = createCudaGraphRunner(std::move(py_instance));
     // initializeResource();
     // model warm up
-    auto inputs = buildInputs(1, 64, 64, 64, true);
+    auto inputs = buildInputs(2, 64, 64, 64, true);
     cuda_graph_runner_->normalForward(inputs);
-    setCufmhaPadded(true);
+    cuda_graph_runner_->setMaxPrefillCudaGraphLen(960);
     cuda_graph_runner_->initCapture();
 }
 
@@ -16,23 +16,24 @@ int CudaGraphPrefillOp::getCurrentRealGraphSize() {
     return cuda_graph_runner_->getCurrentRealGraphBs();
 }
 
-void CudaGraphPrefillOp::setCufmhaPadded(bool is_s_padded) {
-    DeviceBase* device = rtp_llm::DeviceFactory::getDefaultDevice();
-    RTP_LLM_CHECK_WITH_INFO(device != nullptr, "device can't be nullptr");
-    CudaDevice* cuda_device = dynamic_cast<CudaDevice*>(device);
-    cuda_device->setIsPadded(is_s_padded);
-}
-
 CudaGraphRunnerPtr CudaGraphPrefillOp::createCudaGraphRunner(py::object py_instance) {
     DeviceInitParams params;
     DeviceBase*      device                              = rtp_llm::DeviceFactory::getDefaultDevice();
     params.hw_kernel_config.enable_cuda_graph            = true;
-    params.concurrency_config.concurrency_limit          = 128;
+    params.fifo_scheduler_config.max_context_batch_size  = 128;
     params.hw_kernel_config.enable_cuda_graph_debug_mode = false;
     params.hidden_size                                   = 3584;
     params.max_seq_len                                   = 64;
     params.tokens_per_block                              = 64;
     params.hw_kernel_config.enable_cuda_graph_debug_mode = true;
+    params.hw_kernel_config.prefill_capture_seq_lens     = {
+        6,   10,  14,  15,  20,  25,  30,  35,  40,  45,  50,  55,  60,  65,  70,  75,  77,  80,  85,  90,  95,
+        100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150, 155, 160, 165, 170, 175, 180, 185, 190, 195, 200,
+        205, 210, 215, 220, 225, 230, 235, 240, 245, 248, 250, 252, 255, 256, 260, 265, 270, 275, 280, 285, 290,
+        295, 300, 305, 310, 311, 315, 317, 320, 321, 325, 330, 335, 340, 345, 350, 355, 356, 360, 365, 370, 375,
+        380, 385, 390, 395, 399, 400, 405, 410, 411, 415, 420, 425, 430, 435, 440, 445, 450, 455, 460, 465, 470,
+        475, 480, 485, 490, 495, 500, 512, 520, 540, 560, 576, 580, 600, 620, 629, 640, 660, 673, 680, 685, 697,
+        700, 703, 720, 740, 760, 780, 793, 797, 800, 820, 837, 840, 844, 856, 860, 880, 889, 900, 920, 940, 960};
     // int  layer_num                              = 24;
     // int  block_num                              = 26037;
     auto               runner_ptr            = device->getDeviceGraphRunner(params, std::move(py_instance), 0, true);
@@ -124,15 +125,17 @@ PyModelInputs CudaGraphPrefillOp::buildInputs(int64_t batch_size,
     inputs.attention_inputs.is_prefill      = true;
     inputs.attention_inputs.dtype           = torch::kBFloat16;
     inputs.attention_inputs.kv_block_offset = 0;
+    inputs.attention_inputs.is_s_padded     = use_max_padded_mode;
     RTP_LLM_LOG_INFO("kv_cache_block_id_device build success\n");
     // 计算 cu_seqlens
-    size_t    cu_len = batch_size + 1;
-    BufferPtr cu_seqlens_buf =
-        cuda_graph_runner_->device_->allocateBuffer({DataType::TYPE_INT32, {cu_len}, AllocationType::HOST});
+    size_t cu_len = batch_size + 1;
+
+    // 使用 torch 创建 cu_seqlens tensor
+    torch::Tensor cu_seqlens_tensor = torch::zeros({int(cu_len)}, options2).pin_memory();
+    int32_t*      cu_seqlens_data   = cu_seqlens_tensor.data_ptr<int32_t>();
 
     // 手动计算 cu_seqlens - 使用真实有效的长度
-    int32_t* cu_seqlens_data = cu_seqlens_buf->data<int32_t>();
-    int32_t  total_seq_len   = 0;
+    int32_t total_seq_len = 0;
     for (int64_t i = 0; i < batch_size; i++) {
         cu_seqlens_data[i] = total_seq_len;
         if (use_max_padded_mode) {
@@ -146,6 +149,9 @@ PyModelInputs CudaGraphPrefillOp::buildInputs(int64_t batch_size,
         }
     }
     cu_seqlens_data[batch_size] = total_seq_len;
+
+    // 将 torch tensor 转换为 BufferPtr
+    BufferPtr cu_seqlens_buf = torchTensor2Buffer(cu_seqlens_tensor);
     RTP_LLM_LOG_INFO("cu_seqlens_data build success\n");
     inputs.attention_inputs.cu_seqlens = Buffer2torchTensor(cu_seqlens_buf, false);
     if (!use_max_padded_mode) {
@@ -161,8 +167,7 @@ PYBIND11_MODULE(libtest_cuda_graph_prefill_ops, m) {
         .def("init", &CudaGraphPrefillOp::init)
         .def("forward", &cuda_graph::CudaGraphPrefillOp::forward)
         .def("getCurrentRealGraphSize", &cuda_graph::CudaGraphPrefillOp::getCurrentRealGraphSize)
-        .def("buildInputs", &cuda_graph::CudaGraphPrefillOp::buildInputs)
-        .def("setCufmhaPadded", &cuda_graph::CudaGraphPrefillOp::setCufmhaPadded);
+        .def("buildInputs", &cuda_graph::CudaGraphPrefillOp::buildInputs);
 }
 
 }  // namespace cuda_graph

@@ -166,11 +166,11 @@ public:
     std::vector<int64_t> moe_layer_index_ = {};
 
     // EPLB
-    bool                                   enable_eplb_      = false;
-    int64_t                                phy_exp_num_      = 0;  // number of physical experts
-    int64_t                                eplb_update_time_ = 5000;
-    EplbMode                               eplb_mode_        = EplbMode::NONE;
-    __attribute__((visibility("default"))) pybind11::object py_eplb_;
+    bool             enable_eplb_      = false;
+    int64_t          phy_exp_num_      = 0;  // number of physical experts
+    int64_t          eplb_update_time_ = 5000;
+    EplbMode         eplb_mode_        = EplbMode::NONE;
+    pybind11::object py_eplb_;
 
     bool   has_positional_encoding_    = false;
     bool   has_pre_decoder_layernorm_  = false;
@@ -220,22 +220,23 @@ public:
     int64_t fast_gen_max_context_len_         = 0;
     bool    reverse_e_h_norm_                 = false;
 
-    std::string nccl_ip_          = "";
-    bool        use_all_gather_   = false;
-    int64_t     tp_nccl_port_     = 0;
-    int64_t     dp_tp_nccl_port_  = 0;
-    int64_t     ffn_tp_nccl_port_ = 0;
-    int64_t     http_port_        = 0;
-    int64_t     model_rpc_port_   = 0;
-    int64_t     tp_size_          = 1;
-    int64_t     tp_rank_          = 0;
-    int64_t     ep_size_          = 1;
-    int64_t     ep_rank_          = 0;
-    int64_t     dp_size_          = 1;
-    int64_t     dp_rank_          = 0;
-    int64_t     ffn_tp_size_      = 1;
-    int64_t     ffn_tp_rank_      = 0;
-    bool        enable_sp_        = false;
+    std::string nccl_ip_            = "";
+    bool        use_all_gather_     = false;
+    int64_t     tp_nccl_port_       = 0;
+    int64_t     dp_tp_nccl_port_    = 0;
+    int64_t     ffn_tp_nccl_port_   = 0;
+    int64_t     http_port_          = 0;
+    int64_t     model_rpc_port_     = 0;
+    int64_t     embedding_rpc_port_ = 0;
+    int64_t     tp_size_            = 1;
+    int64_t     tp_rank_            = 0;
+    int64_t     ep_size_            = 1;
+    int64_t     ep_rank_            = 0;
+    int64_t     dp_size_            = 1;
+    int64_t     dp_rank_            = 0;
+    int64_t     ffn_tp_size_        = 1;
+    int64_t     ffn_tp_rank_        = 0;
+    bool        enable_sp_          = false;
 
     int64_t world_size_ = 1;
 
@@ -292,6 +293,7 @@ public:
     FIFOSchedulerConfig          fifo_scheduler_config;
     MiscellaneousConfig          misc_config;
     ArpcConfig                   arpc_config;
+    GrpcConfig                   grpc_config;
     FfnDisAggregateConfig        ffn_disaggregate_config;
 
     GptInitParameter();

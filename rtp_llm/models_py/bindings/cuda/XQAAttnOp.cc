@@ -1,11 +1,8 @@
 
 #ifdef USING_CUDA12
 #include "rtp_llm/models_py/bindings/cuda/XQAAttnOp.h"
+#include "rtp_llm/cpp/cuda/cufmha/TrtV2FmhaRunner.h"
 #include "rtp_llm/cpp/core/torch_utils/BufferTorchUtils.h"
-#include "rtp_llm/cpp/devices/cuda_impl/CudaDevice.h"
-#include "rtp_llm/cpp/kernels/unfused_attention_kernels.h"
-#include "rtp_llm/cpp/core/Dispatch.h"
-#include "rtp_llm/cpp/devices/DeviceFactory.h"
 
 namespace rtp_llm {
 
@@ -13,6 +10,7 @@ XQAAttnOp::XQAAttnOp(const GptInitParameter& gpt_init_parameter): FMHACudaBase(g
 
 bool XQAAttnOp::support(torch_ext::PyAttentionInputs attn_inputs) {
     return fmha_config_.enable_xqa && attn_configs_.kv_cache_dtype != KvCacheDataType::INT8
+           && get_sm() >= tensorrt_llm::kernels::kSM_90
            && supportXqa(DataType::TYPE_BF16,
                          DataType::TYPE_BF16,
                          DataType::TYPE_FP8_E4M3,
@@ -30,16 +28,23 @@ ParamsBasePtr XQAAttnOp::prepare(torch_ext::PyAttentionInputs attn_inputs) {
                             "decode should have kv cache block id.");
     kv_cache_block_id_host   = torchTensor2Buffer(attn_inputs.kv_cache_block_id_host);
     kv_cache_block_id_device = torchTensor2Buffer(attn_inputs.kv_cache_block_id_device);
-    // not support has_alibi_slopes
 
-    auto trt_params =
-        device_->prepareTrtAttn(attn_configs_, attn_inputs.kv_block_offset, kv_cache_block_id_device, batch_size);
+    // 使用独立的工具函数准备 TRT attention 参数
+    auto run_stream   = at::cuda::getCurrentCUDAStream(at::cuda::current_device()).stream();
+    bool use_fp8_fmha = attn_configs_.kv_cache_dtype == KvCacheDataType::FP8;
+    auto trt_params   = prepareTrtAttnParams(attn_configs_,
+                                           attn_inputs.kv_block_offset,
+                                           kv_cache_block_id_device,
+                                           batch_size,
+                                           use_fp8_fmha,
+                                           run_stream,
+                                           false);
 
-    params->kv_block_array   = ((TRTAttn*)trt_params.get())->kv_block_array;
-    params->kv_cache_offset  = Buffer2torchTensor(((TRTAttn*)trt_params.get())->kv_cache_offset, false).clone();
-    params->batch_size       = batch_size;
-    params->max_seq_len      = attn_inputs.sequence_lengths.max().item<int32_t>();
-    params->sequence_lengths = attn_inputs.sequence_lengths;
+    params->kv_block_array            = ((TRTAttn*)trt_params.get())->kv_block_array;
+    params->kv_cache_offset           = ((TRTAttn*)trt_params.get())->kv_cache_offset.clone();
+    params->batch_size                = batch_size;
+    params->max_seq_len               = attn_inputs.sequence_lengths.max().item<int32_t>();
+    params->sequence_lengths          = attn_inputs.sequence_lengths;
     params->kv_block_array.cache_type = attn_configs_.kv_cache_dtype;
 
     return ParamsBasePtr(params);
@@ -79,8 +84,7 @@ XQAAttnOp::forward(const torch::Tensor& input, std::optional<torch_ext::KVCache>
            kv_cache.value().k_cache_base.data_ptr(),  // params->kv_block_array.mPrimaryPoolPtr,
            reinterpret_cast<int32_t*>((KVCacheIndex*)(params->kv_cache_offset.data_ptr())),
            kv_block_array.cache_type == KvCacheDataType::FP8,
-           reinterpret_cast<uint32_t*>(params->sequence_lengths.data_ptr()),
-           device_);
+           reinterpret_cast<uint32_t*>(params->sequence_lengths.data_ptr()));
     return output;
 }
 

@@ -6,7 +6,7 @@ import torch.nn as nn
 from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
 from rtp_llm.distribute.collective import Group, all_reduce
 from rtp_llm.models_py.modules import FusedQKRMSNorm
-from rtp_llm.models_py.modules.fmha import FMHAImplBase
+from rtp_llm.models_py.modules.common.mha.base import FMHAImplBase
 from rtp_llm.models_py.modules.linear_factory import LinearFactory
 from rtp_llm.ops.compute_ops import KVCache
 from rtp_llm.utils.model_weight import W
@@ -47,14 +47,14 @@ class CausalAttention(nn.Module):
         hidden_states: torch.Tensor,
         fmha_impl: FMHAImplBase,
         kv_cache: Optional[KVCache],
+        need_rope_kv_cache: bool = True,
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
         qkv = self.qkv_proj(hidden_states)
         if self.qk_fuse_norm is not None:
             qkv = self.qk_fuse_norm(qkv)
-        attn_output = fmha_impl.forward(qkv, kv_cache)
+        attn_output = fmha_impl.forward(qkv, kv_cache, need_rope_kv_cache)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-
         output = self.o_proj(attn_output)
         if self.config.tp_size > 1:
             output = all_reduce(output, group=Group.TP)
