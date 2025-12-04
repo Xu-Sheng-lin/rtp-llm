@@ -28,6 +28,17 @@ class AiterMlaParams(MlaParams):
         self.max_seq_len = input_lengths.max().item()
         self.batch_size = input_lengths.size(0)
 
+        self.batch_indice: Optional[torch.Tensor] = None
+        self.page_indice: Optional[torch.Tensor] = None
+        self.reuse_cache_page_indice: Optional[torch.Tensor] = None
+        self.decode_page_indptr: Optional[torch.Tensor] = None
+        self.prefill_page_indptr: Optional[torch.Tensor] = None
+        self.paged_kv_last_page_len: Optional[torch.Tensor] = None
+        self.qo_indptr: Optional[torch.Tensor] = None
+        self.kvlen: Optional[torch.Tensor] = None
+        self.positions: Optional[torch.Tensor] = None
+        self.batch_reuse_info_vec: Optional[torch.Tensor] = None
+
 def rocm_fill_mla_params(
         t_prefix_lengths: torch.Tensor,
         t_sequence_lengths: torch.Tensor,
