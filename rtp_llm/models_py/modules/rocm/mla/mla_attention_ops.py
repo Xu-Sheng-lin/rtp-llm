@@ -204,7 +204,7 @@ class AiterMlaDecodeOp:
             self.page_size,
         )
 
-    def forward(self, q, kv_buffer, fmha_params):
+    def forward(self, q, fmha_params):
         max_seqlen_q = fmha_params.max_seq_len
         qo_indptr = fmha_params.qo_indptr
         total_q = qo_indptr[-1].item()
@@ -363,7 +363,7 @@ try:
             """Handle long sequences using cache reuse operation."""
             # Handle cache reuse for longer sequences
             return self.fmha_impl.forward(
-                q, compressed_kv, self.fmha_params
+                q, self.fmha_params
             )
 
         def _handle_short_sequence(
@@ -378,7 +378,7 @@ try:
             )
 
             return self.aborb_fmha.forward(
-                q_nope, compressed_kv, self.fmha_params
+                q_nope, self.fmha_params
             )
 
         def forward(
@@ -460,7 +460,7 @@ try:
                 self.write_cache_store_impl(kv_cache)
             assert self.fmha_impl is not None
             res = self.fmha_impl.forward(
-                q, compressed_kv, self.fmha_params
+                q, self.fmha_params
             )
             return res
 
