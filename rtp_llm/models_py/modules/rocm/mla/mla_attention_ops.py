@@ -36,7 +36,6 @@ def rocm_fill_mla_params(
         seq_size_per_block: int
 ) -> MlaParams:
     params = MlaParams(t_input_lengths)
-    device = t_input_lengths.device
 
     def to_cpu(tensor):
         return tensor.cpu().numpy() if tensor is not None else None
@@ -109,7 +108,7 @@ def rocm_fill_mla_params(
         qo_indptr.append(accu_q_len)
 
     def to_hip_tensor(data, dtype=torch.int32):
-        return torch.tensor(data, dtype=dtype, device=device)
+        return torch.tensor(data, dtype=dtype, device=torch.device("cuda"))
 
     params.batch_indice = to_hip_tensor(batch_indice)
     params.page_indice = to_hip_tensor(page_indice)
@@ -145,7 +144,7 @@ class AiterMlaPrefillOp:
         return self.fmha_params
 
     def forward(self, q, kv_buffer, fmha_params):
-        max_seqlen_q = fmha_params.max_seqlen_q
+        max_seqlen_q = fmha_params.max_seq_len
 
         qo_indptr = torch.zeros(fmha_params.batch_size + 1, dtype=torch.int)
         kv_indptr = torch.zeros(fmha_params.batch_size + 1, dtype=torch.int)
@@ -197,7 +196,7 @@ class AiterMlaDecodeOp:
         return self.fmha_params
 
     def forward(self, q, kv_buffer, fmha_params):
-        max_seqlen_q = fmha_params.max_seqlen_q
+        max_seqlen_q = fmha_params.max_seq_len
 
         qo_indptr = torch.zeros(fmha_params.batch_size + 1, dtype=torch.int)
         kv_indptr = torch.zeros(fmha_params.batch_size + 1, dtype=torch.int)
