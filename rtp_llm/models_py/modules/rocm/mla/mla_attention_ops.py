@@ -8,7 +8,7 @@ from rtp_llm.models_py.modules.mla.flashinfer_mla import check_attention_inputs
 from rtp_llm.models_py.modules.fmha import FMHADecodeImplBase, FMHAPrefillImplBase
 from rtp_llm.ops.compute_ops import (
     KVCache,
-    MlaParams,
+    ParamsBase,
     PyAttentionInputs,
     rtp_llm_ops
 )
@@ -18,7 +18,7 @@ from aiter.mla import (
     mla_prefill_fwd
 )
 
-class AiterMlaParams(MlaParams):
+class MlaParams(ParamsBase):
     def __init__(
         self,
         input_lengths: torch.Tensor
@@ -35,7 +35,7 @@ def rocm_fill_mla_params(
         t_kv_cache_block_id_host: torch.Tensor,
         seq_size_per_block: int
 ) -> MlaParams:
-    params = AiterMlaParams(t_input_lengths)
+    params = MlaParams(t_input_lengths)
 
     def to_cpu(tensor):
         return tensor.cpu().numpy() if tensor is not None else None
