@@ -158,11 +158,20 @@ class MlaParams:
     @property
     def batch_indice(self) -> torch.Tensor:
         ...
+    @batch_indice.setter
+    def batch_indice(self, arg0: torch.Tensor) -> None:
+        ...
     @property
     def kvlen(self) -> torch.Tensor:
         ...
+    @kvlen.setter
+    def kvlen(self, arg0: torch.Tensor) -> None:
+        ...
     @property
     def page_indice(self) -> torch.Tensor:
+        ...
+    @page_indice.setter
+    def page_indice(self, arg0: torch.Tensor) -> None:
         ...
     @property
     def page_indptr(self) -> torch.Tensor:
@@ -170,11 +179,20 @@ class MlaParams:
     @property
     def paged_kv_last_page_len(self) -> torch.Tensor:
         ...
+    @paged_kv_last_page_len.setter
+    def paged_kv_last_page_len(self, arg0: torch.Tensor) -> None:
+        ...
     @property
     def positions(self) -> torch.Tensor:
         ...
+    @positions.setter
+    def positions(self, arg0: torch.Tensor) -> None:
+        ...
     @property
     def qo_indptr(self) -> torch.Tensor:
+        ...
+    @qo_indptr.setter
+    def qo_indptr(self, arg0: torch.Tensor) -> None:
         ...
 class ParamsBase:
     def __init__(self) -> None:
