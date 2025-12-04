@@ -1,9 +1,7 @@
 import itertools
 import math
-import os
 import random
-import sys
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 from unittest import SkipTest, TestCase, main
 
 import torch
@@ -19,8 +17,7 @@ from rtp_llm.models.rotary_embedding.deepseek_rotary_embedding import (
 )
 
 from rtp_llm.models_py.modules.mla import MlaAttention
-from rtp_llm.models_py.modules.rocm.mla_attention import (
-    AiterMlaDecodeImpl,
+from rtp_llm.models_py.modules.rocm.mla.mla_attention_ops import (
     AiterMlaPrefillImpl
 )
 

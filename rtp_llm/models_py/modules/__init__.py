@@ -19,7 +19,7 @@ if device_type == DeviceType.ROCm:
     import rtp_llm.models_py.modules.rocm_registry  # isort:skip
     from rtp_llm.models_py.modules.rocm.fmha import DECODE_MHA_IMPS  # isort:skip
     from rtp_llm.models_py.modules.rocm.fmha import PREFILL_MHA_IMPS  # isort:skip
-    from rtp_llm.models_py.modules.rocm.mla_attention import DECODE_MLA_IMPS, PREFILL_MLA_IMPS
+    from rtp_llm.models_py.modules.rocm.mla.mla_attention_ops import DECODE_MLA_IMPS, PREFILL_MLA_IMPS
 
 else:
     from rtp_llm.models_py.modules.norm import FusedQKRMSNorm, RMSNorm
