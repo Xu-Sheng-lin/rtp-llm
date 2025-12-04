@@ -8,7 +8,7 @@ from rtp_llm.models_py.modules.mla.flashinfer_mla import check_attention_inputs
 from rtp_llm.models_py.modules.fmha import FMHADecodeImplBase, FMHAPrefillImplBase
 from rtp_llm.ops.compute_ops import (
     KVCache,
-    ParamsBase,
+    MlaParams,
     PyAttentionInputs,
     rtp_llm_ops
 )
@@ -18,7 +18,7 @@ from aiter.mla import (
     mla_prefill_fwd
 )
 
-class MlaParams(ParamsBase):
+class AiterMlaParams(MlaParams):
     def __init__(
         self,
         input_lengths: torch.Tensor
@@ -35,7 +35,7 @@ def rocm_fill_mla_params(
         t_kv_cache_block_id_host: torch.Tensor,
         seq_size_per_block: int
 ) -> MlaParams:
-    params = MlaParams(t_input_lengths)
+    params = AiterMlaParams(t_input_lengths)
 
     def to_cpu(tensor):
         return tensor.cpu().numpy() if tensor is not None else None
@@ -132,43 +132,49 @@ def rocm_fill_mla_params(
 class AiterMlaPrefillOp:
     def __init__(self, config: GptInitModelParameters):
         self.head_num = config.head_num
+        self.head_num_kv = config.head_num_kv
+        self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.nope_head_dim
         self.qk_rope_head_dim = config.rope_head_dim
+        self.page_size = config.seq_size_per_block
+        self.v_head_dim = config.v_head_dim
 
     def support(self, attn_inputs: PyAttentionInputs) -> bool:
         return True
 
     def prepare(self, attn_inputs: PyAttentionInputs):
         # Create prefill parameters using pure Python implementation
-        self.fmha_params = MlaParams(input_lengths=attn_inputs.input_lengths)
-        return self.fmha_params
+        return rocm_fill_mla_params(
+            attn_inputs.prefix_lengths,
+            attn_inputs.sequence_lengths,
+            attn_inputs.input_lengths,
+            attn_inputs.kv_cache_block_id_host,
+            self.page_size,
+        )
 
-    def forward(self, q, kv_buffer, fmha_params):
+    def forward(self, q, fmha_params):
         max_seqlen_q = fmha_params.max_seq_len
-
-        qo_indptr = torch.zeros(fmha_params.batch_size + 1, dtype=torch.int)
-        kv_indptr = torch.zeros(fmha_params.batch_size + 1, dtype=torch.int)
-        kv_last_page_lens = torch.ones(fmha_params.batch_size, dtype=torch.int)
+        qo_indptr = fmha_params.qo_indptr
         total_q = qo_indptr[-1].item()
-        total_kv = kv_indptr[-1].item()
-        num_page = kv_buffer.size(0)
-        kv_indices = torch.randint(0, num_page, (total_kv,), dtype=torch.int)
+        page_num = fmha_params.decode_page_indptr[-1].item()
+
+        kv_buffer = torch.empty(
+            (page_num, self.page_size, self.head_num_kv, self.kv_lora_rank + self.qk_rope_head_dim),
+            dtype=torch.bfloat16,
+        ).fill_(-1)
+        out_asm = torch.empty((total_q, self.head_num, self.v_head_dim), dtype=torch.bfloat16).fill_(-1)
 
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        v_head_dim = self.qk_nope_head_dim
         sm_scale = 1.0 / (qk_head_dim ** 0.5)
-
-        out_dtype = torch.bfloat16
-        out_asm = torch.empty((total_q, self.head_num, v_head_dim), dtype=out_dtype).fill_(-1)
 
         attn_logits, attn_lse = mla_prefill_fwd(
             q=q, # shape: [num_seqs, num_heads, head_size]
             kv_buffer=kv_buffer, # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
             o=out_asm, # shape: [num_seqs, num_heads, v_head_dim]
             qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            kv_last_page_lens=kv_last_page_lens,
+            kv_indptr=fmha_params.prefill_page_indptr,
+            kv_indices=fmha_params.batch_indice,
+            kv_last_page_lens=fmha_params.paged_kv_last_page_len,
             max_seqlen_q=max_seqlen_q,
             sm_scale=sm_scale
         )
@@ -178,49 +184,49 @@ class AiterMlaPrefillOp:
 class AiterMlaDecodeOp:
     def __init__(self, config: GptInitModelParameters):
         self.head_num = config.head_num
+        self.head_num_kv = config.head_num_kv
+        self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.nope_head_dim
         self.qk_rope_head_dim = config.rope_head_dim
-
-        self.kv_cache_data_type = config.kv_cache_data_type
-        self.use_asm_pa = config.hw_kernel_config.use_asm_pa
-        self.enable_cuda_graph = (
-            config.gpt_init_params.hw_kernel_config.enable_cuda_graph
-        )
+        self.page_size = config.seq_size_per_block
+        self.v_head_dim = config.v_head_dim
 
     def support(self, attn_inputs: PyAttentionInputs) -> bool:
         return True
 
     def prepare(self, attn_inputs: PyAttentionInputs):
         # Create decode parameters using pure Python implementation
-        self.fmha_params = MlaParams(input_lengths=attn_inputs.input_lengths)
-        return self.fmha_params
+        return rocm_fill_mla_params(
+            attn_inputs.prefix_lengths,
+            attn_inputs.sequence_lengths,
+            attn_inputs.input_lengths,
+            attn_inputs.kv_cache_block_id_host,
+            self.page_size,
+        )
 
     def forward(self, q, kv_buffer, fmha_params):
         max_seqlen_q = fmha_params.max_seq_len
-
-        qo_indptr = torch.zeros(fmha_params.batch_size + 1, dtype=torch.int)
-        kv_indptr = torch.zeros(fmha_params.batch_size + 1, dtype=torch.int)
-        kv_last_page_lens = torch.ones(fmha_params.batch_size, dtype=torch.int)
+        qo_indptr = fmha_params.qo_indptr
         total_q = qo_indptr[-1].item()
-        total_kv = kv_indptr[-1].item()
-        num_page = kv_buffer.size(0)
-        kv_indices = torch.randint(0, num_page, (total_kv,), dtype=torch.int)
+        page_num = fmha_params.decode_page_indptr[-1].item()
+
+        kv_buffer = torch.empty(
+            (page_num, self.page_size, self.head_num_kv, self.kv_lora_rank + self.qk_rope_head_dim),
+            dtype=torch.bfloat16,
+        ).fill_(-1)
+        out_asm = torch.empty((total_q, self.head_num, self.v_head_dim), dtype=torch.bfloat16).fill_(-1)
 
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        v_head_dim = self.qk_nope_head_dim
         sm_scale = 1.0 / (qk_head_dim ** 0.5)
 
-        out_dtype = torch.bfloat16
-        out_asm = torch.empty((total_q, self.head_num, v_head_dim), dtype=out_dtype).fill_(-1)
-
-        attn_logits, attn_lse = mla_decode_fwd(
-            q=q,  # shape: [num_seqs, num_heads, head_size]
-            kv_buffer=kv_buffer,  # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
-            o=out_asm,  # shape: [num_seqs, num_heads, v_head_dim]
+        attn_logits, attn_lse = mla_prefill_fwd(
+            q=q, # shape: [num_seqs, num_heads, head_size]
+            kv_buffer=kv_buffer, # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+            o=out_asm, # shape: [num_seqs, num_heads, v_head_dim]
             qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            kv_last_page_lens=kv_last_page_lens,
+            kv_indptr=fmha_params.prefill_page_indptr,
+            kv_indices=fmha_params.batch_indice,
+            kv_last_page_lens=fmha_params.paged_kv_last_page_len,
             max_seqlen_q=max_seqlen_q,
             sm_scale=sm_scale
         )
