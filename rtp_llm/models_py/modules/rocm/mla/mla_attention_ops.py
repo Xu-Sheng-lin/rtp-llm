@@ -156,8 +156,9 @@ class AiterMlaPrefillOp:
         )
 
     def forward(self, q: torch.Tensor,
-        fmha_params: Any,
-        layer_id: int):
+                kv_cache: Optional[KVCache],
+                fmha_params: Any,
+                layer_id: int):
         k_weight = self.weights[layer_id].get(W.mla_kc, None)
         q_nope, q_pe = torch.split(
             q,
@@ -222,9 +223,9 @@ class AiterMlaDecodeOp:
         )
 
     def forward(self, q: torch.Tensor,
-        kv_cache: Optional[KVCache],
-        fmha_params: Any,
-        layer_id: int):
+                kv_cache: Optional[KVCache],
+                fmha_params: Any,
+                layer_id: int):
         k_weight = self.weights[layer_id].get(W.mla_kc, None)
         q_nope, q_pe = torch.split(
             q,
