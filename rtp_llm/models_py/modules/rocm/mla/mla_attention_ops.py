@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
+from rtp_llm.models_py.modules.linear_factory import LinearFactory
 from rtp_llm.models_py.modules.common.mla.utils import check_attention_inputs
 from rtp_llm.models_py.modules.common.mha import FMHADecodeImplBase, FMHAPrefillImplBase
 from rtp_llm.ops.compute_ops import (
@@ -14,6 +15,7 @@ from rtp_llm.ops.compute_ops import (
 )
 from rtp_llm.utils.model_weight import W
 
+import aiter
 from aiter.mla import (
     mla_decode_fwd,
     mla_prefill_fwd
@@ -27,6 +29,8 @@ class MlaParams(ParamsBase):
         super().__init__()
 
         self.max_seq_len = input_lengths.max().item()
+        self.max_seqlen_q = self.max_seq_len
+        self.max_seqlen_k = self.max_seq_len
         self.batch_size = input_lengths.size(0)
 
 def rocm_fill_mla_params(
@@ -63,6 +67,7 @@ def rocm_fill_mla_params(
     total_page_idx = 0
     accu_q_len = 0
     accu_kv_len = 0
+    max_kv_len = 0
     batch_start_idx = 0
 
     for i in range(batch_size):
@@ -76,6 +81,8 @@ def rocm_fill_mla_params(
             seq_len = input_length + prefix_length
             accu_q_len += input_length
             accu_kv_len += seq_len
+            if seq_len > max_kv_len:
+                max_kv_len = seq_len
 
             page_num = (prefix_length + seq_size_per_block - 1) // seq_size_per_block
             if kv_cache_block_id is not None:
@@ -120,6 +127,7 @@ def rocm_fill_mla_params(
     params.qo_indptr = to_hip_tensor(qo_indptr)
     params.kvlen = to_hip_tensor(kvlen)
     params.positions = to_hip_tensor(positions)
+    params.max_seqlen_k = max_kv_len
 
     if len(reuse_cache_page_indice) > 0:
         flat_info = [elem for sublist in batch_reuse_info_vec for elem in sublist]
@@ -133,8 +141,9 @@ def rocm_fill_mla_params(
 class AiterMlaPrefillOp:
     def __init__(self, config: GptInitModelParameters,
                  weights: List[Dict[str, torch.Tensor]]):
-        self.head_num = config.head_num
-        self.head_num_kv = config.head_num_kv
+        self.config = config
+        self.head_num = config.head_num // config.tp_size
+        self.head_num_kv = config.head_num_kv // config.tp_size
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.nope_head_dim
         self.qk_rope_head_dim = config.rope_head_dim
@@ -155,8 +164,10 @@ class AiterMlaPrefillOp:
             self.page_size,
         )
 
-    def forward(self, q: torch.Tensor,
-                kv_cache: Optional[KVCache],
+    def forward(self,
+                q: torch.Tensor,
+                compressed_kv: torch.Tensor,
+                k_pe: torch.Tensor,
                 fmha_params: Any,
                 layer_id: int):
         k_weight = self.weights[layer_id].get(W.mla_kc, None)
@@ -169,39 +180,46 @@ class AiterMlaPrefillOp:
         q_nope = q_nope.transpose(0, 1)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
-        max_seqlen_q = fmha_params.max_seq_len
-        qo_indptr = fmha_params.qo_indptr
-        total_q = qo_indptr[-1].item()
-        page_num = fmha_params.decode_page_indptr[-1].item()
-
-        kv_buffer = torch.empty(
-            (page_num, self.page_size, 1, self.kv_lora_rank + self.qk_rope_head_dim),
-            dtype=torch.bfloat16,
-        ).fill_(-1)
-        out_asm = torch.empty((total_q, self.head_num, self.v_head_dim), dtype=torch.bfloat16).fill_(-1)
-
-        qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        sm_scale = 1.0 / (qk_head_dim ** 0.5)
-
-        attn_logits, attn_lse = mla_prefill_fwd(
-            q=q, # shape: [num_seqs, num_heads, head_size]
-            kv_buffer=kv_buffer, # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
-            o=out_asm, # shape: [num_seqs, num_heads, v_head_dim]
-            qo_indptr=qo_indptr,
-            kv_indptr=fmha_params.prefill_page_indptr,
-            kv_indices=fmha_params.batch_indice,
-            kv_last_page_lens=fmha_params.paged_kv_last_page_len,
-            max_seqlen_q=max_seqlen_q,
-            sm_scale=sm_scale
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        self.k_nope_proj = LinearFactory.create_linear_from_weights(
+            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None, self.config
         )
 
-        return attn_logits
+        self.v_proj = LinearFactory.create_linear_from_weights(
+            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None, self.config
+        )
+
+        k_nope = self.k_nope_proj(compressed_kv)
+        value_states = self.v_proj(compressed_kv)
+
+        k_nope = k_nope.view(-1, self.head_num_kv, self.qk_nope_head_dim)
+        value_states = value_states.view(-1, self.head_num_kv, self.v_head_dim)
+
+        k = k_pe.new_empty(
+            k_pe.size(0), self.head_num_kv, self.qk_rope_head_dim + self.qk_nope_head_dim
+        )
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim:] = k_pe
+
+        res = aiter.flash_attn_varlen_func(
+            q,  # Query张量: (total_q, nheads, headdim_q) - 批次中所有query token的总数
+            k,  # Key张量: (total_k, nheads_k, headdim_q) - 批次中所有key token的总数
+            value_states,  # Value张量: (total_k, nheads_k, headdim_v) - 批次中所有value token的总数
+            fmha_params.qo_indptr,  # Query累积序列长度: (batch_size + 1,) dtype=int32 - 用于索引q张量
+            fmha_params.prefill_page_indptr,  # Key累积序列长度: (batch_size + 1,) dtype=int32 - 用于索引k/v张量
+            fmha_params.max_seqlen_q,  # 批次中最大query序列长度
+            fmha_params.max_seqlen_k,  # 批次中最大key序列长度
+            dropout_p=0.0,  # Dropout概率 - 评估时应设为0.0
+            causal=True,  # 因果注意力掩码 - 用于自回归建模，每个位置只能关注自己和之前的位置
+        )
+
+        return res
 
 class AiterMlaDecodeOp:
     def __init__(self, config: GptInitModelParameters,
                  weights: List[Dict[str, torch.Tensor]]):
-        self.head_num = config.head_num
-        self.head_num_kv = config.head_num_kv
+        self.head_num = config.head_num // config.tp_size
+        self.head_num_kv = config.head_num_kv // config.tp_size
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.nope_head_dim
         self.qk_rope_head_dim = config.rope_head_dim
@@ -225,7 +243,8 @@ class AiterMlaDecodeOp:
     def forward(self, q: torch.Tensor,
                 kv_cache: Optional[KVCache],
                 fmha_params: Any,
-                layer_id: int):
+                layer_id: int,
+                is_absorb_prefill: bool = False):
         k_weight = self.weights[layer_id].get(W.mla_kc, None)
         q_nope, q_pe = torch.split(
             q,
@@ -236,33 +255,41 @@ class AiterMlaDecodeOp:
         q_nope = q_nope.transpose(0, 1)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
-        # compressed_kv = kv_cache.k_cache_base
-
         max_seqlen_q = fmha_params.max_seq_len
         qo_indptr = fmha_params.qo_indptr
         total_q = qo_indptr[-1].item()
-        page_num = fmha_params.decode_page_indptr[-1].item()
 
-        kv_buffer = torch.empty(
-            (page_num, self.page_size, 1, self.kv_lora_rank + self.qk_rope_head_dim),
-            dtype=torch.bfloat16,
-        ).fill_(-1)
+        ckv_cache_shape = kv_cache.k_cache_base.shape
+        kv_buffer = kv_cache.k_cache_base.view(ckv_cache_shape[0], ckv_cache_shape[1], 1, ckv_cache_shape[2])
         out_asm = torch.empty((total_q, self.head_num, self.v_head_dim), dtype=torch.bfloat16).fill_(-1)
 
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         sm_scale = 1.0 / (qk_head_dim ** 0.5)
 
-        attn_logits, attn_lse = mla_decode_fwd(
-            q=q, # shape: [num_seqs, num_heads, head_size]
-            kv_buffer=kv_buffer, # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
-            o=out_asm, # shape: [num_seqs, num_heads, v_head_dim]
-            qo_indptr=qo_indptr,
-            kv_indptr=fmha_params.prefill_page_indptr,
-            kv_indices=fmha_params.batch_indice,
-            kv_last_page_lens=fmha_params.paged_kv_last_page_len,
-            max_seqlen_q=max_seqlen_q,
-            sm_scale=sm_scale
-        )
+        if is_absorb_prefill:
+            attn_logits, attn_lse = mla_prefill_fwd(
+                q=q,  # shape: [num_seqs, num_heads, head_size]
+                kv_buffer=kv_buffer,  # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+                o=out_asm,  # shape: [num_seqs, num_heads, v_head_dim]
+                qo_indptr=qo_indptr,
+                kv_indptr=fmha_params.prefill_page_indptr,
+                kv_indices=fmha_params.batch_indice,
+                kv_last_page_lens=fmha_params.paged_kv_last_page_len,
+                max_seqlen_q=max_seqlen_q,
+                sm_scale=sm_scale
+            )
+        else:
+            attn_logits, attn_lse = mla_decode_fwd(
+                q=q, # shape: [num_seqs, num_heads, head_size]
+                kv_buffer=kv_buffer, # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+                o=out_asm, # shape: [num_seqs, num_heads, v_head_dim]
+                qo_indptr=qo_indptr,
+                kv_indptr=fmha_params.prefill_page_indptr,
+                kv_indices=fmha_params.batch_indice,
+                kv_last_page_lens=fmha_params.paged_kv_last_page_len,
+                max_seqlen_q=max_seqlen_q,
+                sm_scale=sm_scale
+            )
 
         return attn_logits
 
@@ -376,6 +403,7 @@ try:
         def compute_prefill_context(
             self,
             q: torch.Tensor,
+            k_pe: torch.Tensor,
             compressed_kv: torch.Tensor,
             kv_cache: Optional[KVCache],
             layer_id: int
@@ -383,27 +411,31 @@ try:
             """Compute prefill context with optimized cache reuse logic."""
             if q.size(0) < self.absorb_opt_len and self.has_reuse_cache:
                 return self._handle_short_sequence(
-                    q, compressed_kv, kv_cache, layer_id
+                    q, kv_cache, layer_id
                 )
             else:
                 return self._handle_long_sequence(
-                    q, compressed_kv, kv_cache, layer_id
+                    q, compressed_kv, k_pe, layer_id
                 )
 
         def _handle_long_sequence(
             self,
-            q: torch.Tensor, compressed_kv: torch.Tensor,
-            kv_cache: Optional[KVCache], layer_id: int
+            q: torch.Tensor,
+            compressed_kv: torch.Tensor,
+            k_pe: torch.Tensor,
+            layer_id: int
         ):
             """Handle long sequences using cache reuse operation."""
             # Handle cache reuse for longer sequences
             return self.fmha_impl.forward(
-                q, kv_cache, self.fmha_params, layer_id
+                q, compressed_kv, k_pe, self.fmha_params, layer_id
             )
 
         def _handle_short_sequence(
-            self, q: torch.Tensor, compressed_kv: torch.Tensor,
-            kv_cache: Optional[KVCache], layer_id: int
+            self,
+            q: torch.Tensor,
+            kv_cache: Optional[KVCache],
+            layer_id: int
         ) -> torch.Tensor:
             """Handle short sequences using absorb operation."""
             # Split query into nope and pe components
@@ -414,7 +446,7 @@ try:
             )
 
             return self.aborb_fmha.forward(
-                q_nope, kv_cache, self.fmha_params, layer_id
+                q_nope, kv_cache, self.fmha_params, layer_id, True
             )
 
         def forward(
@@ -440,7 +472,7 @@ try:
                 self.write_cache_store_impl(kv_cache)
             assert self.fmha_impl is not None
             return self.compute_prefill_context(
-                q, compressed_kv, kv_cache, layer_id
+                q, k_pe, compressed_kv, kv_cache, layer_id
             )
 
 except ImportError:
@@ -495,7 +527,7 @@ try:
                 self.write_cache_store_impl(kv_cache)
             assert self.fmha_impl is not None
             res = self.fmha_impl.forward(
-                q, kv_cache, self.fmha_params, layer_id
+                q, kv_cache, self.fmha_params, layer_id, False
             )
             return res
 
