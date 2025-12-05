@@ -13,6 +13,7 @@ from flashinfer.utils import is_sm90a_supported
 
 from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
 from rtp_llm.models_py.modules.linear_factory import LinearFactory
+from rtp_llm.models_py.modules.common.mla.utils import check_attention_inputs
 
 # from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
 from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs, rtp_llm_ops
