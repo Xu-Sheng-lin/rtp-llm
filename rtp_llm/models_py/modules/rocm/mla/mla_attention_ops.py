@@ -170,16 +170,6 @@ class AiterMlaPrefillOp:
                 k_pe: torch.Tensor,
                 fmha_params: Any,
                 layer_id: int):
-        k_weight = self.weights[layer_id].get(W.mla_kc, None)
-        q_nope, q_pe = torch.split(
-            q,
-            [self.qk_nope_head_dim, self.qk_rope_head_dim],
-            dim=-1,
-        )
-        q_nope = torch.bmm(q_nope.transpose(0, 1), k_weight)
-        q_nope = q_nope.transpose(0, 1)
-        q = torch.cat([q_nope, q_pe], dim=-1)
-
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         self.k_nope_proj = LinearFactory.create_linear_from_weights(
             self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None, self.config
