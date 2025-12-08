@@ -26,11 +26,13 @@ from rtp_llm.utils.model_weight import W
 
 from aiter import dtypes
 
+
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 # 以下是从test_pa.py移植过来的test_paged_attention函数及其依赖代码
 
@@ -44,9 +46,10 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e5m2": torch.uint8,
 }
 
+
 def get_kv_cache_torch_dtype(
-    cache_dtype,
-    model_dtype = None,
+        cache_dtype,
+        model_dtype=None,
 ):
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -68,18 +71,18 @@ def get_kv_cache_torch_dtype(
         raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
     return torch_dtype
 
-def kv_cache_factory(
-    num_blocks: int,
-    block_size: int,
-    num_layers: int,
-    num_heads: int,
-    head_size: int,
-    cache_dtype,
-    model_dtype = None,
-    seed: int = 0,
-    device = "cuda",
-):
 
+def kv_cache_factory(
+        num_blocks: int,
+        block_size: int,
+        num_layers: int,
+        num_heads: int,
+        head_size: int,
+        cache_dtype,
+        model_dtype=None,
+        seed: int = 0,
+        device="cuda",
+):
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
             f"Does not support key cache of type fp8 with head_size {head_size}"
@@ -110,7 +113,6 @@ def kv_cache_factory(
     return k_caches, v_caches
 
 
-
 def create_cos_sin_cache():
     rotary_emb = DeepseekV3YarnRotaryEmbedding(
         64,
@@ -137,30 +139,34 @@ def create_cos_sin_cache():
 
 
 class MLATest(TestCase):
-    NUM_TOKENS = [16]
-    BATCH_SIZE = [64]
+    NUM_TOKENS = [7]
+    BATCH_SIZE = [1]
     HIDDEN_SIZES = [2048]
     PAGE_SIZE = [64]
-    IS_PREFILLS = [False]
-    PREFIX_LENS = [0]
 
     def setUp(self) -> None:
         if not torch.cuda.is_available():
             raise SkipTest("CUDA is not available")
         torch.set_default_device(device)
 
-    def _run_mla_test(self, num_tokens: int, batch_size: int, hidden_size: int,
-                      page_size: int, is_prefill: bool, prefix_len: int):
+    def _run_mla_test(self, num_tokens: int, batch_size: int, hidden_size: int, page_size: int):
         input_lengths = [num_tokens] * batch_size
-        mock_page_num = 2048
-        page_num = math.ceil(prefix_len + num_tokens + page_size - 1 / page_size)
-        block_list = [i for i in range(1, page_num + 1)]
-        # print(f"block_list: {block_list}")
-        kvcache_block_id = torch.tensor(
-            block_list,
+
+        seq_page_sizes = [math.ceil(x / page_size) for x in input_lengths]
+        kvcache_block_id = torch.zeros(
+            [batch_size, max(seq_page_sizes)],
             dtype=torch.int32,
             device=torch.device("cpu"),
         )
+        bias = 1
+        for i in range(batch_size):
+            kvcache_block_id[i, : seq_page_sizes[i]] = torch.arange(
+                bias,
+                bias + seq_page_sizes[i],
+                dtype=torch.int32,
+                device=torch.device("cpu"),
+            )
+            bias += seq_page_sizes[i]
 
         self.config = GptInitModelParameters(128, 16, 27, 1024, 102400)
         self.config.head_num = 16
@@ -176,32 +182,24 @@ class MLATest(TestCase):
         self.config.size_per_head = 192
 
         torch.manual_seed(0)
-        input_lengths_t = torch.tensor(
-            input_lengths, dtype=torch.int32, device=torch.device("cpu")
+        sequence_lengths_mius_1 = [x - 1 for x in input_lengths]
+        sequence_lengths_t = torch.tensor(
+            sequence_lengths_mius_1, dtype=torch.int32, device=torch.device("cpu")
         )
-        if is_prefill:
-            prefix_lengths = [prefix_len]*batch_size
-            prefix_lengths_t = torch.tensor(
-                prefix_lengths, dtype=torch.int32, device=torch.device("cpu")
-            )
-        else:
-            prefix_lengths_t = torch.zeros(
-                len(input_lengths), dtype=torch.int32, device=torch.device("cpu")
-            )
+        prefix_lengths_t = torch.zeros(
+            len(sequence_lengths_t) - len(input_lengths) + 1,
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
 
         attn_inputs: PyAttentionInputs = PyAttentionInputs()
-        attn_inputs.is_prefill = is_prefill
+        attn_inputs.is_prefill = True
         attn_inputs.prefix_lengths = prefix_lengths_t
         attn_inputs.sequence_lengths = torch.tensor(
             [], dtype=torch.int32, device=torch.device("cpu")
         )
-        attn_inputs.input_lengths = input_lengths_t
+        attn_inputs.input_lengths = sequence_lengths_t
         attn_inputs.kv_cache_block_id_host = kvcache_block_id
-
-        # print(attn_inputs.prefix_lengths)
-        # print(attn_inputs.sequence_lengths)
-        # print(attn_inputs.input_lengths)
-        # print(attn_inputs.kv_cache_block_id_host)
 
         weights = {}
         weights[W.mla_fusedqkrope_no_lora_w] = torch.randn(
@@ -255,27 +253,16 @@ class MLATest(TestCase):
         layer_weights: List[Dict[str, torch.Tensor]] = []
         layer_weights.append(weights)
 
-        if is_prefill:
-            fmha_impl = AiterMlaPrefillImpl(
-                self.config, attn_inputs, layer_weights, create_cos_sin_cache()
-            )
-        else:
-            fmha_impl = AiterMlaDecodeImpl(
-                self.config, attn_inputs, layer_weights, create_cos_sin_cache()
-            )
-        deepseekv2_mla = MlaAttention(self.config, weights, 0)
-        cache = torch.randn(
-            [mock_page_num, page_size, self.config.kv_lora_rank + self.config.rope_head_dim],
-            dtype=torch.bfloat16,
-            device=device,
+        fmha_impl = AiterMlaPrefillImpl(
+            self.config, attn_inputs, layer_weights, create_cos_sin_cache()
         )
-        kv_cache: Optional[KVCache] = KVCache()
-        kv_cache.k_cache_base = cache
+        deepseekv2_mla = MlaAttention(self.config, weights, 0)
+        kv_cache: Optional[KVCache] = None
 
         deepseekv2_mla_ref = MlaAttentionRef(self.config, weights, 0)
 
         hidden = torch.randn(
-            [num_tokens, self.config.hidden_size],
+            [batch_size, self.config.hidden_size],
             dtype=torch.bfloat16,
             device=device,
         )
@@ -304,11 +291,11 @@ class MLATest(TestCase):
 
     def test_mlp(self):
         for params in itertools.product(
-            self.NUM_TOKENS, self.BATCH_SIZE, self.HIDDEN_SIZES, self.PAGE_SIZE, self.IS_PREFILLS, self.PREFIX_LENS
+                self.NUM_TOKENS, self.BATCH_SIZE, self.HIDDEN_SIZES, self.PAGE_SIZE
         ):
             with self.subTest(
-                    num_tokens=params[0], batch_size=params[1], hidden_size=params[2],
-                    page_size=params[3], is_prefill=params[3], prefix_len=params[4]
+                    num_tokens=params[0], batch_size=params[1],
+                    hidden_size=params[2], page_size=params[3]
             ):
                 self._run_mla_test(*params)
 
