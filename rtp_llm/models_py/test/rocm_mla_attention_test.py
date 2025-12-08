@@ -77,7 +77,7 @@ def create_cos_sin_cache():
 
 
 class MLATest(TestCase):
-    SEQ_LENS = [[7]]
+    SEQ_LENS = [[16]]
     HIDDEN_SIZES = [2048]
     PAGE_SIZE = [64]
 
@@ -88,7 +88,6 @@ class MLATest(TestCase):
 
     def _run_mla_test(self, sequence_lengths: list[int], hidden_size: int, page_size: int):
         batch_size = len(sequence_lengths)
-        num_tokens = sum(sequence_lengths)
 
         seq_page_sizes = [math.ceil(x / page_size) for x in sequence_lengths]
         kvcache_block_id = torch.zeros(
@@ -120,24 +119,27 @@ class MLATest(TestCase):
         self.config.size_per_head = 192
 
         torch.manual_seed(0)
-        sequence_lengths_mius_1 = [x - 1 for x in sequence_lengths]
         sequence_lengths_t = torch.tensor(
-            sequence_lengths_mius_1, dtype=torch.int32, device=torch.device("cpu")
+            sequence_lengths, dtype=torch.int32, device=torch.device("cpu")
         )
         prefix_lengths_t = torch.zeros(
-            len(sequence_lengths_t) - len(sequence_lengths) + 1,
+            len(sequence_lengths_t),
             dtype=torch.int32,
             device=torch.device("cpu"),
         )
+        input_lengths_t = sequence_lengths_t - prefix_lengths_t
 
         attn_inputs: PyAttentionInputs = PyAttentionInputs()
         attn_inputs.is_prefill = True
         attn_inputs.prefix_lengths = prefix_lengths_t
-        attn_inputs.sequence_lengths = torch.tensor(
-            [], dtype=torch.int32, device=torch.device("cpu")
-        )
-        attn_inputs.input_lengths = sequence_lengths_t
+        attn_inputs.sequence_lengths = sequence_lengths_t
+        attn_inputs.input_lengths = input_lengths_t
         attn_inputs.kv_cache_block_id_host = kvcache_block_id
+
+        # print(attn_inputs.prefix_lengths)
+        # print(attn_inputs.sequence_lengths)
+        # print(attn_inputs.input_lengths)
+        # print(attn_inputs.kv_cache_block_id_host)
 
         weights = {}
         weights[W.mla_fusedqkrope_no_lora_w] = torch.randn(
@@ -199,7 +201,7 @@ class MLATest(TestCase):
         deepseekv2_mla_ref = MlaAttentionRef(self.config, weights, 0)
 
         hidden = torch.randn(
-            [num_tokens, self.config.hidden_size],
+            [batch_size, self.config.hidden_size],
             dtype=torch.bfloat16,
             device=device,
         )

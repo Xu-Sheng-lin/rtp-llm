@@ -87,7 +87,7 @@ def rocm_fill_mla_params(
             page_num = (prefix_length + seq_size_per_block - 1) // seq_size_per_block
             if kv_cache_block_id is not None:
                 reuse_cache_page_indice.extend(
-                    [kv_cache_block_id[i * max_batch_blocks + j] for j in range(page_num)]
+                    [kv_cache_block_id[i, j] for j in range(page_num)]
                 )
 
             if prefix_length > 0:
@@ -108,7 +108,7 @@ def rocm_fill_mla_params(
 
         page_num = (seq_len + seq_size_per_block - 1) // seq_size_per_block
         if kv_cache_block_id is not None:
-            page_indice.extend([kv_cache_block_id[i * max_batch_blocks + j] for j in range(page_num)])
+            page_indice.extend([kv_cache_block_id[i, j] for j in range(page_num)])
             total_page_idx += page_num
 
         decode_page_indptr.append(total_page_idx)
@@ -182,11 +182,11 @@ class AiterMlaPrefillOp:
         k_nope = self.k_nope_proj(compressed_kv)
         value_states = self.v_proj(compressed_kv)
 
-        k_nope = k_nope.view(-1, self.head_num_kv, self.qk_nope_head_dim)
-        value_states = value_states.view(-1, self.head_num_kv, self.v_head_dim)
+        k_nope = k_nope.view(-1, self.head_num, self.qk_nope_head_dim)
+        value_states = value_states.view(-1, self.head_num, self.v_head_dim)
 
         k = k_pe.new_empty(
-            k_pe.size(0), self.head_num_kv, self.qk_rope_head_dim + self.qk_nope_head_dim
+            k_pe.size(0), self.head_num, self.qk_rope_head_dim + self.qk_nope_head_dim
         )
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim:] = k_pe
@@ -429,14 +429,8 @@ try:
         ) -> torch.Tensor:
             """Handle short sequences using absorb operation."""
             # Split query into nope and pe components
-            q_nope, q_pe = torch.split(
-                q,
-                [self.aborb_fmha.qk_nope_head_dim, self.aborb_fmha.qk_rope_head_dim],
-                dim=-1,
-            )
-
             return self.aborb_fmha.forward(
-                q_nope, kv_cache, self.fmha_params, layer_id, True
+                q, kv_cache, self.fmha_params, layer_id, True
             )
 
         def forward(
@@ -447,7 +441,6 @@ try:
             kv_cache: Optional[KVCache],
             layer_id: int,
         ):
-
             assert self.rope_kvcache_impl is not None and self.rope_params is not None
             q_pe = q[:, :, self.fmha_impl.qk_nope_head_dim :]
             self.rope_kvcache_impl.forward(
