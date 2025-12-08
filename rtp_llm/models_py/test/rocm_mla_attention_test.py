@@ -77,7 +77,7 @@ def create_cos_sin_cache():
 
 
 class MLATest(TestCase):
-    NUM_TOKENS = [7]
+    SEQ_LENS = [[7]]
     HIDDEN_SIZES = [2048]
     PAGE_SIZE = [64]
 
@@ -86,11 +86,9 @@ class MLATest(TestCase):
             raise SkipTest("CUDA is not available")
         torch.set_default_device(device)
 
-    def _run_mla_test(self, num_tokens: int, hidden_size: int, page_size: int):
-        sequence_lengths = [2]
-
+    def _run_mla_test(self, sequence_lengths: list[int], hidden_size: int, page_size: int):
         batch_size = len(sequence_lengths)
-        num_tokens = len(sequence_lengths)
+        num_tokens = sum(sequence_lengths)
 
         seq_page_sizes = [math.ceil(x / page_size) for x in sequence_lengths]
         kvcache_block_id = torch.zeros(
@@ -230,7 +228,7 @@ class MLATest(TestCase):
 
     def test_mlp(self):
         for params in itertools.product(
-            self.NUM_TOKENS, self.HIDDEN_SIZES, self.PAGE_SIZE
+            self.SEQ_LENS, self.HIDDEN_SIZES, self.PAGE_SIZE
         ):
             with self.subTest(
                 num_tokens=params[0], hidden_size=params[1], page_size=params[2]
