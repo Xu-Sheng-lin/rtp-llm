@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from rtp_llm.models_py.modules.factory.fused_moe.config_resolver import (
+from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
     MoeConfigResolver,
 )
 from rtp_llm.ops.compute_ops import DeviceType
@@ -19,7 +19,7 @@ class TestMoeConfigResolver(unittest.TestCase):
     def test_get_device_type(self):
         """Test getting device type"""
         with patch(
-            "rtp_llm.models_py.modules.factory.fused_moe.config_resolver.get_device"
+            "rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver.get_device"
         ) as mock_device:
             mock_device.return_value.get_device_type.return_value = DeviceType.Cuda
             device_type = self.resolver.get_device_type()

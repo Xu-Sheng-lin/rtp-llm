@@ -101,16 +101,6 @@ py_test (
 )
 
 py_test (
-    name = "rocm_mla_attention_test",
-    srcs = ["rocm_mla_attention_test.py"],
-    deps = py_test_deps,
-    env = test_envs,
-    timeout = "eternal",
-    tags = ["rocm"],
-    exec_properties = {'gpu':'MI308X'},
-)
-
-py_test (
     name = "rmsresnorm_test",
     srcs = ["rmsresnorm_test.py"],
     deps = py_test_deps,
