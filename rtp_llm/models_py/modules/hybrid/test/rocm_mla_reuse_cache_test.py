@@ -18,7 +18,7 @@ from rtp_llm.models_py.modules.hybrid.test.mla_attention_ref import attention_re
 from rtp_llm.models_py.modules.factory.attention.rocm_impl.mla_attention import (
     AiterMlaPrefillImpl
 )
-from rtp_llm.models_py.modules.factory import LinearFactory
+from rtp_llm.models_py.modules.factory.linear import LinearFactory
 from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs, rtp_llm_ops
 from rtp_llm.utils.model_weight import W
 

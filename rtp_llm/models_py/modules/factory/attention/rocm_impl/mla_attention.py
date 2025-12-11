@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
-from rtp_llm.models_py.modules.factory import LinearFactory
+from rtp_llm.models_py.modules.factory.linear import LinearFactory
 from rtp_llm.models_py.modules.factory.attention.mla_utils import check_attention_inputs
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHADecodeImplBase, FMHAPrefillImplBase
 from rtp_llm.ops.compute_ops import (
