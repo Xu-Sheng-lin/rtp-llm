@@ -21,10 +21,11 @@ from aiter.mla import (
     mla_prefill_fwd
 )
 
+
 class MlaParams(ParamsBase):
     def __init__(
-        self,
-        input_lengths: torch.Tensor
+            self,
+            input_lengths: torch.Tensor
     ):
         super().__init__()
 
@@ -32,6 +33,7 @@ class MlaParams(ParamsBase):
         self.max_seqlen_q = self.max_seq_len
         self.max_seqlen_k = self.max_seq_len
         self.batch_size = input_lengths.size(0)
+
 
 def rocm_fill_mla_params(
         t_prefix_lengths: torch.Tensor,
@@ -51,9 +53,9 @@ def rocm_fill_mla_params(
     kv_cache_block_id = to_cpu(t_kv_cache_block_id_host) if t_kv_cache_block_id_host.numel() > 0 else None
 
     batch_size = input_lengths.shape[0]
-    max_batch_blocks = kv_cache_block_id.shape[1] if kv_cache_block_id is not None else -1
 
     batch_indice = []
+    kv_indices = []
     positions = []
     paged_kv_last_page_len = []
     kvlen = []
@@ -70,8 +72,11 @@ def rocm_fill_mla_params(
     max_kv_len = 0
     batch_start_idx = 0
 
+    print(input_lengths)
+    print(prefix_lengths)
+
     for i in range(batch_size):
-        if prefix_lengths is not None: # prefill
+        if prefix_lengths is not None:  # prefill
             input_length = input_lengths[i]
             prefix_length = prefix_lengths[i]
 
@@ -84,6 +89,7 @@ def rocm_fill_mla_params(
             if seq_len > max_kv_len:
                 max_kv_len = seq_len
 
+            kv_indices.extend([(j // seq_size_per_block + total_page_idx + 1) for j in range(seq_len)])
             page_num = (prefix_length + seq_size_per_block - 1) // seq_size_per_block
             if kv_cache_block_id is not None:
                 reuse_cache_page_indice.extend(
@@ -95,12 +101,14 @@ def rocm_fill_mla_params(
                 batch_start_idx += page_num
             else:
                 batch_reuse_info_vec.append([i, 0, 0, 0])
-        else: # decode
+        else:  # decode
             batch_indice.append(i)
             positions.append(sequence_lengths[i])
             seq_len = sequence_lengths[i] + 1
             accu_q_len += 1
             accu_kv_len += 1
+
+        print("accu_kv_len:", accu_kv_len)
 
         last_page_len = (seq_len - 1) % seq_size_per_block + 1
         paged_kv_last_page_len.append(last_page_len)
@@ -120,6 +128,7 @@ def rocm_fill_mla_params(
 
     params.batch_indice = to_hip_tensor(batch_indice)
     params.page_indice = to_hip_tensor(page_indice)
+    params.kv_indices = to_hip_tensor(kv_indices)
     params.reuse_cache_page_indice = to_hip_tensor(reuse_cache_page_indice)
     params.decode_page_indptr = to_hip_tensor(decode_page_indptr)
     params.prefill_page_indptr = to_hip_tensor(prefill_page_indptr)
@@ -137,6 +146,7 @@ def rocm_fill_mla_params(
         )
 
     return params
+
 
 class AiterMlaPrefillOp:
     def __init__(self, config: GptInitModelParameters,
@@ -191,6 +201,17 @@ class AiterMlaPrefillOp:
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim:] = k_pe
 
+        print(q.shape)
+        print(q)
+        print(k.shape)
+        print(k)
+        print(value_states.shape)
+        print(value_states)
+        print(fmha_params.qo_indptr)
+        print(fmha_params.prefill_page_indptr)
+        print(fmha_params.max_seqlen_q)
+        print(fmha_params.max_seqlen_k)
+
         res = aiter.flash_attn_varlen_func(
             q,  # Query张量: (total_q, nheads, headdim_q) - 批次中所有query token的总数
             k,  # Key张量: (total_k, nheads_k, headdim_q) - 批次中所有key token的总数
@@ -204,6 +225,7 @@ class AiterMlaPrefillOp:
         )
 
         return res
+
 
 class AiterMlaDecodeOp:
     def __init__(self, config: GptInitModelParameters,
@@ -236,6 +258,8 @@ class AiterMlaDecodeOp:
                 layer_id: int,
                 is_absorb_prefill: bool = False):
         k_weight = self.weights[layer_id].get(W.mla_kc, None)
+        v_weight = self.weights[layer_id].get(W.mla_vc, None)
+
         q_nope, q_pe = torch.split(
             q,
             [self.qk_nope_head_dim, self.qk_rope_head_dim],
@@ -251,7 +275,7 @@ class AiterMlaDecodeOp:
 
         ckv_cache_shape = kv_cache.k_cache_base.shape
         kv_buffer = kv_cache.k_cache_base.view(ckv_cache_shape[0], ckv_cache_shape[1], 1, ckv_cache_shape[2])
-        out_asm = torch.empty((total_q, self.head_num, self.v_head_dim), dtype=torch.bfloat16).fill_(-1)
+        out_asm = torch.empty((total_q, self.head_num, self.kv_lora_rank), dtype=torch.bfloat16).fill_(-1)
 
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         sm_scale = 1.0 / (qk_head_dim ** 0.5)
@@ -263,25 +287,29 @@ class AiterMlaDecodeOp:
                 o=out_asm,  # shape: [num_seqs, num_heads, v_head_dim]
                 qo_indptr=qo_indptr,
                 kv_indptr=fmha_params.prefill_page_indptr,
-                kv_indices=fmha_params.batch_indice,
+                kv_indices=fmha_params.kv_indices,
                 kv_last_page_lens=fmha_params.paged_kv_last_page_len,
                 max_seqlen_q=max_seqlen_q,
                 sm_scale=sm_scale
             )
         else:
             attn_logits, attn_lse = mla_decode_fwd(
-                q=q, # shape: [num_seqs, num_heads, head_size]
-                kv_buffer=kv_buffer, # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
-                o=out_asm, # shape: [num_seqs, num_heads, v_head_dim]
+                q=q,  # shape: [num_seqs, num_heads, head_size]
+                kv_buffer=kv_buffer,  # shape: [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+                o=out_asm,  # shape: [num_seqs, num_heads, v_head_dim]
                 qo_indptr=qo_indptr,
                 kv_indptr=fmha_params.prefill_page_indptr,
-                kv_indices=fmha_params.batch_indice,
+                kv_indices=fmha_params.kv_indices,
                 kv_last_page_lens=fmha_params.paged_kv_last_page_len,
                 max_seqlen_q=max_seqlen_q,
                 sm_scale=sm_scale
             )
 
-        return attn_logits
+        attn_output = attn_logits.view(-1, self.head_num, self.kv_lora_rank)
+        attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), v_weight)
+        attn_bmm_output = attn_bmm_output.transpose(0, 1)
+        return attn_bmm_output
+
 
 class AiterMlaRotaryEmbeddingOp:
     """Rocm rotary positional embedding."""
@@ -350,6 +378,7 @@ class AiterMlaRotaryEmbeddingOp:
                 rope_params.paged_kv_last_page_len,
             )
 
+
 try:
 
     class AiterMlaPrefillImpl(FMHAPrefillImplBase):
@@ -393,8 +422,8 @@ try:
         def compute_prefill_context(
             self,
             q: torch.Tensor,
-            k_pe: torch.Tensor,
             compressed_kv: torch.Tensor,
+            k_pe: torch.Tensor,
             kv_cache: Optional[KVCache],
             layer_id: int
         ):
@@ -442,20 +471,20 @@ try:
             layer_id: int,
         ):
             assert self.rope_kvcache_impl is not None and self.rope_params is not None
-            q_pe = q[:, :, self.fmha_impl.qk_nope_head_dim :]
+            q_pe = q[:, :, self.fmha_impl.qk_nope_head_dim:]
             self.rope_kvcache_impl.forward(
                 q_pe, k_pe, compressed_kv, self.rope_params, kv_cache
             )
 
             if (
-                self.attn_inputs.is_prefill
-                and self.attn_inputs.cache_store_inputs
-                and self.write_cache_store_impl is not None
+                    self.attn_inputs.is_prefill
+                    and self.attn_inputs.cache_store_inputs
+                    and self.write_cache_store_impl is not None
             ):
                 self.write_cache_store_impl(kv_cache)
             assert self.fmha_impl is not None
             return self.compute_prefill_context(
-                q, k_pe, compressed_kv, kv_cache, layer_id
+                q, compressed_kv, k_pe, kv_cache, layer_id
             )
 
 except ImportError:
@@ -497,7 +526,7 @@ try:
             layer_id: int,
         ):
             assert self.rope_kvcache_impl is not None and self.rope_params is not None
-            q_pe = q[:, :, self.fmha_impl.qk_nope_head_dim :]
+            q_pe = q[:, :, self.fmha_impl.qk_nope_head_dim:]
             self.rope_kvcache_impl.forward(
                 q_pe, k_pe, compressed_kv, self.rope_params, kv_cache
             )

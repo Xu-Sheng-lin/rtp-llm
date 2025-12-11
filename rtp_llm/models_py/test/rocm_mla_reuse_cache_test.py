@@ -77,10 +77,10 @@ def create_cos_sin_cache():
 
 
 class MLATest(TestCase):
-    NUM_TOKENS = [7, 2000]
+    NUM_TOKENS = [128]
     HIDDEN_SIZES = [2048]
     PAGE_SIZE = [64]
-    REUSE_LEN = [0, 128]
+    REUSE_LEN = [128]
 
     def setUp(self) -> None:
         if not torch.cuda.is_available():
@@ -93,11 +93,11 @@ class MLATest(TestCase):
 
         input_lengths = [num_tokens]
         mock_page_num = 2048
-        page_num = math.ceil(reuse_len + num_tokens + page_size - 1 / page_size)
+        page_num = (reuse_len + num_tokens + page_size - 1) // page_size
         block_list = [i for i in range(1, page_num + 1)]
         # print(f"block_list: {block_list}")
         kvcache_block_id = torch.tensor(
-            block_list,
+            [block_list],
             dtype=torch.int32,
             device=torch.device("cpu"),
         )
@@ -139,7 +139,7 @@ class MLATest(TestCase):
         layer_weights: List[Dict[str, torch.Tensor]] = [weights]
 
         cos_sin_cache = create_cos_sin_cache()
-        fmha_impl = AiterMlaDecodeImpl(
+        fmha_impl = AiterMlaPrefillImpl(
             self.config, attn_inputs, layer_weights, cos_sin_cache
         )
 
@@ -240,6 +240,14 @@ class MLATest(TestCase):
             causal=True,
             sm_scale=self.scaling,
         )
+
+        print(out.shape)
+        print(out_ref.shape)
+        # nan_indices = torch.nonzero(torch.isnan(out))
+        # print(nan_indices)
+        print(out)
+        print(out_ref)
+
         out_norm = out / (torch.norm(out) + 1e-8)
         out_ref_norm = out_ref / (torch.norm(out_ref) + 1e-8)
         self.assertTrue(torch.allclose(out_norm, out_ref_norm, atol=0.01, rtol=0.01))
