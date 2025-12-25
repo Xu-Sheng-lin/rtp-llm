@@ -2,10 +2,13 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
-from rtp_llm.distribute.collective import Group, all_gather
+from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
 from rtp_llm.models_py.distributed.deepep_initializer import DeepEpInitializer
-from rtp_llm.models_py.kernels.cuda.fp8_kernel import scaled_fp8_per_token_quant
+from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
+from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+    scaled_fp8_per_token_quant,
+    sgl_per_token_group_quant_fp8,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.defs.fused_moe import (
     ExpertForwardPayload,
     ExpertTokensMetadata,
@@ -16,7 +19,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
 from rtp_llm.ops.compute_ops import trt_fp8_quantize_128
-
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import MoEConfigAdapter
 
 class DeepepNormalRouter(FusedMoeDataRouter):
     @classmethod
@@ -24,7 +27,7 @@ class DeepepNormalRouter(FusedMoeDataRouter):
         return RouterType.DEEPEP_NORMAL
 
     @classmethod
-    def check_conditions(cls, checker: Any, config: GptInitModelParameters) -> None:
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
         """Check if DeepepNormalRouter can handle the configuration"""
         from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
             MoeConfigResolver,
@@ -37,7 +40,7 @@ class DeepepNormalRouter(FusedMoeDataRouter):
 
     def __init__(
         self,
-        config: GptInitModelParameters,
+        config: MoEConfigAdapter,
         use_fp8: bool = True,
         async_mode: bool = False,
         expert_alignment: int = 128,
@@ -89,6 +92,14 @@ class DeepepNormalRouter(FusedMoeDataRouter):
                 a1, a1_scale = scaled_fp8_per_token_quant(a1, None)
                 assert a1.shape[1] % 128 == 0
                 a1_scale = a1_scale.repeat(1, a1.shape[1] // 128)
+            elif is_deep_gemm_e8m0_used():
+                a1, a1_scale = sgl_per_token_group_quant_fp8(
+                    a1,
+                    128,
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                )
             else:
                 a1, a1_scale = trt_fp8_quantize_128(a1, False)
 
@@ -135,7 +146,7 @@ class DeepepNormalRouter(FusedMoeDataRouter):
         if self.use_fp8:
             if quant_config.is_per_act_token:
                 expert_x, expert_x_scale = output
-                expert_x_scale = expert_x_scale[:, 0].unsqueeze(1)
+                expert_x_scale = expert_x_scale[:, 0].contiguous()
             else:
                 expert_x, expert_x_scale = output
         else:
@@ -146,23 +157,12 @@ class DeepepNormalRouter(FusedMoeDataRouter):
             num_recv_tokens_per_expert_list, device=expert_x.device, dtype=torch.int32
         )
 
-        if recv_topk_idx.numel() != 0 and (
-            not self.use_fp8 or quant_config.is_per_act_token
-        ):
-            expert_topk_ids = torch.where(
-                recv_topk_idx == -1,
-                self.expert_num - 1 if self.rank_expert_offset == 0 else 0,
-                recv_topk_idx + self.rank_expert_offset,
-            )
-        else:
-            expert_topk_ids = recv_topk_idx
-
         return ExpertForwardPayload(
             expert_x,
             act_dtype,
             expert_x_scale,
             ExpertTokensMetadata(expert_num_tokens, num_recv_tokens_per_expert_list),
-            expert_topk_ids,
+            recv_topk_idx,
             recv_topk_weights,
         )
 

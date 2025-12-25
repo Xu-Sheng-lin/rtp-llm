@@ -29,7 +29,10 @@ cc_library(
     ],
     deps = [
         ":py_utils",
-        "//rtp_llm/cpp/config:gpt_init_params",
+        "//rtp_llm/cpp/config:config_modules",
+        "//rtp_llm/cpp/config:model_config",  # Add ModelConfig implementation
+        "//rtp_llm/cpp/model_utils:model_utils",
+        "//rtp_llm/cpp/config:eplb_config",
         "//rtp_llm/cpp/utils:core_utils",
         "//rtp_llm/cpp/utils:hash_util",
     ],
@@ -63,20 +66,8 @@ cc_library(
         "common/InitEngineOps.cc",
         "multi_gpu_gpt/RtpEmbeddingOp.cc",
         "multi_gpu_gpt/RtpLLMOp.cc",
-    ] +  select({
-        "@//:using_cuda12": [
-            "common/NcclOp.cc",
-        ],
-        "@//:using_cuda": [
-            "common/NcclOp.cc",
-        ],
-        "@//:using_rocm": [
-            "common/NcclOp.cc",
-        ],
-        "//conditions:default": [],
-    }),
+    ],
     hdrs = [
-        "common/NcclOp.h",
         "common/InitEngineOps.h",
         "common/blockUtil.h",
         "multi_gpu_gpt/RtpEmbeddingOp.h",

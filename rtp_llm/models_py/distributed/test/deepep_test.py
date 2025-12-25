@@ -12,7 +12,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed import ProcessGroup
 
-from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
+from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.models_py.distributed.deepep_wrapper import (
     DeepEPBuffer,
     DeepEPConfig,
@@ -20,48 +20,21 @@ from rtp_llm.models_py.distributed.deepep_wrapper import (
     get_deepep_wrapper,
     init_deepep_wrapper,
 )
-from rtp_llm.models_py.distributed.test.process_group_state import (
+from rtp_llm.models_py.distributed.collective_torch import (
     destroy_distributed_environment,
     init_distributed_environment,
 )
 from rtp_llm.models_py.utils.math import align
-from rtp_llm.test.utils.bench_util import bench, bench_kineto, calc_diff, hash_tensor
+from rtp_llm.test.utils.bench_util import bench, bench_kineto
+from rtp_llm.test.utils.numeric_util import (
+    calc_diff,
+    hash_tensor,
+    per_token_cast_back,
+    per_token_cast_to_fp8,
+)
+from rtp_llm.ops import FfnDisAggregateConfig, MoeConfig, ParallelismConfig
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import MoEConfigAdapter
 from rtp_llm.test.utils.port_util import PortsContext
-
-
-def ceil_to_ue8m0(x: torch.Tensor):
-    assert x.view(-1).amax().item() > 0
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
-
-
-def per_token_cast_to_fp8(
-    x: torch.Tensor, use_ue8m0: bool
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2 and x.size(1) % 128 == 0
-    m, n = x.shape
-    x_view = x.view(m, -1, 128)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    sf = x_amax / 448.0
-    sf = ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), sf
-
-
-def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
-    if x_scales.dtype == torch.int:
-        if os.getenv("ACCL_FP8_CAST_LEVEL", "1") == "2":
-            x_scales = x_scales << 23
-        else:
-            x_scales = x_scales.view(dtype=torch.int8).to(torch.int) << 23
-
-        x_scales = x_scales.view(dtype=torch.float)
-
-    if os.getenv("ACCL_FP8_CAST_LEVEL", "1") == "2":
-        x_fp32 = x_fp8.to(torch.float32).view(x_fp8.size(0), -1, x_fp8.size(1))
-    else:
-        x_fp32 = x_fp8.to(torch.float32).view(x_fp8.size(0), -1, 128)
-
-    x_scales = x_scales.view(x_fp8.size(0), -1, 1)
-    return (x_fp32 * x_scales).view(x_fp8.shape).to(torch.bfloat16)
 
 
 def inplace_unique(x: torch.Tensor, num_slots: int):
@@ -1833,39 +1806,89 @@ class DeepEPTest(TestCase):
         return hash_value
 
     @staticmethod
+    def _create_deepep_config(
+        rank: int,
+        num_ranks: int,
+        args: Dict[str, Any],
+        use_deepep_low_latency: bool = False,
+        enable_ffn_disaggregate: bool = False,
+        deep_ep_num_sm: int = 24,
+    ) -> MoEConfigAdapter:
+        """Helper function to create MoEConfigAdapter for DeepEP tests."""
+        model_config = ModelConfig()
+        model_config.attn_config.head_num = 2
+        model_config.attn_config.size_per_head = 128
+        model_config.num_layers = 2
+        model_config.max_seq_len = 2048
+        model_config.vocab_size = 500000
+        if args:
+            model_config.moe_k = args.get("moe_k", 2)
+            model_config.expert_num = args.get("expert_num", 4)
+            model_config.hidden_size = args.get("hidden_size", 128)
+        
+        parallelism_config = ParallelismConfig()
+        parallelism_config.nccl_ip = "127.0.0.1"
+        parallelism_config.th_nccl_port = int(os.getenv("MASTER_PORT", "8376"))
+        parallelism_config.dp_rank = rank
+        parallelism_config.dp_size = num_ranks
+        parallelism_config.tp_rank = 0
+        parallelism_config.tp_size = 1
+        parallelism_config.ep_size = num_ranks
+        parallelism_config.ep_rank = rank
+        parallelism_config.world_size = num_ranks
+        parallelism_config.local_rank = rank
+        parallelism_config.world_rank = rank
+        parallelism_config.local_world_size = num_ranks
+        
+        moe_config = MoeConfig()
+        moe_config.use_deepep_low_latency = use_deepep_low_latency
+        moe_config.use_deepep_internode = False
+        moe_config.deep_ep_num_sm = deep_ep_num_sm
+        
+        max_generate_batch_size = 32
+        if args:
+            max_generate_batch_size = args.get("max_generate_batch_size", 32)
+        
+        ffn_disaggregate_config = FfnDisAggregateConfig()
+        ffn_disaggregate_config.enable_ffn_disaggregate = enable_ffn_disaggregate
+        if enable_ffn_disaggregate and args:
+            ffn_disaggregate_config.attention_dp_size = num_ranks // 2
+            ffn_disaggregate_config.attention_tp_size = 1
+            ffn_disaggregate_config.ffn_dp_size = num_ranks // 2
+            ffn_disaggregate_config.ffn_tp_size = 1
+        
+        # Set ffn_disaggregate_config to parallelism_config
+        parallelism_config.ffn_disaggregate_config = ffn_disaggregate_config
+        
+        # Create and return MoEConfigAdapter
+        config_adapter = MoEConfigAdapter(
+            model_config=model_config,
+            parallelism_config=parallelism_config,
+            moe_config=moe_config,
+            max_generate_batch_size=max_generate_batch_size,
+        )
+        return config_adapter
+
+    @staticmethod
     def _run_deepep_intranode_test(rank: int, num_ranks: int, args: Dict[str, Any]):
         # set env
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_ranks))
         # init params
-        params = GptInitModelParameters(
-            head_num=2,
-            size_per_head=128,
-            layer_num=2,
-            max_seq_len=2048,
-            vocab_size=500000,
-        )
-        params.nccl_ip = "127.0.0.1"
-        params.th_nccl_port = int(os.getenv("MASTER_PORT", "8376"))
-        params.dp_rank = rank
-        params.dp_size = num_ranks
-        params.tp_rank = 0
-        params.tp_size = 1
-        params.ep_size = num_ranks
-        params.ep_rank = rank
-        params.world_size = num_ranks
-        params.local_rank = rank
-        params.moe_config.use_deepep_low_latency = False
-        params.moe_config.use_deepep_internode = False
-        params.gpt_init_params.ffn_disaggregate_config.enable_ffn_disaggregate = False
-        params.moe_config.deep_ep_num_sm = 24
-        params.moe_k = args["moe_k"]
-        params.expert_num = args["expert_num"]
-        params.hidden_size = args["hidden_size"]
+        config_adapter = DeepEPTest._create_deepep_config(rank, num_ranks, args, use_deepep_low_latency=False, enable_ffn_disaggregate=False)
         # init distributed environment
-        torch.cuda.set_device(params.local_rank)
-        torch.set_default_device(f"cuda:{params.local_rank}")
-        init_distributed_environment(params=params, backend="nccl", timeout=60)
-        init_deepep_wrapper(group=dist.group.WORLD, params=params)
+
+        torch.cuda.set_device(config_adapter.parallelism_config.local_rank)
+        torch.set_default_device(f"cuda:{config_adapter.parallelism_config.local_rank}")
+        init_distributed_environment(
+            parallelism_config=config_adapter.parallelism_config,
+            backend="nccl",
+            timeout=60
+        )
+        init_deepep_wrapper(
+            group=dist.group.WORLD,
+            config_adapter=config_adapter,
+        )
+
         deep_ep_wrapper = get_deepep_wrapper()
         buffer = deep_ep_wrapper.buffer
         # run test
@@ -1893,41 +1916,28 @@ class DeepEPTest(TestCase):
         os.environ["ACCL_LOW_LATENCY_OPTIMIZE"] = "1"
         os.environ["ACCL_TOPO_FIX"] = "1"
         os.environ["ACCL_LOAD_BALANCE"] = "1"
-        # init params
-        params = GptInitModelParameters(
-            head_num=2,
-            size_per_head=128,
-            layer_num=2,
-            max_seq_len=2048,
-            vocab_size=500000,
-        )
-        params.nccl_ip = "127.0.0.1"
-        params.th_nccl_port = int(os.getenv("MASTER_PORT", "8376"))
-        params.dp_rank = rank
-        params.dp_size = num_ranks
-        params.tp_rank = 0
-        params.tp_size = 1
-        params.ep_size = num_ranks
-        params.ep_rank = rank
-        params.world_size = num_ranks
-        params.local_rank = rank
-        params.moe_config.use_deepep_low_latency = True
-        params.moe_config.use_deepep_internode = False
-        params.gpt_init_params.ffn_disaggregate_config.enable_ffn_disaggregate = False
-        params.moe_k = args["moe_k"]
-        params.expert_num = args["expert_num"]
-        params.hidden_size = args["hidden_size"]
-        params.max_generate_batch_size = args["max_generate_batch_size"]
+
+        config_adapter = DeepEPTest._create_deepep_config(rank, num_ranks, args, use_deepep_low_latency=True, enable_ffn_disaggregate=False)
+
         # init distributed environment
-        torch.cuda.set_device(params.local_rank)
-        torch.set_default_device(f"cuda:{params.local_rank}")
-        init_distributed_environment(params=params, backend="nccl", timeout=60)
-        init_deepep_wrapper(group=dist.group.WORLD, params=params)
+
+        torch.cuda.set_device(config_adapter.parallelism_config.local_rank)
+        torch.set_default_device(f"cuda:{config_adapter.parallelism_config.local_rank}")
+        init_distributed_environment(
+            parallelism_config=config_adapter.parallelism_config,
+            backend="nccl",
+            timeout=60
+        )
+        init_deepep_wrapper(
+            group=dist.group.WORLD,
+            config_adapter=config_adapter,
+        )
+
         deep_ep_wrapper = get_deepep_wrapper()
         buffer = deep_ep_wrapper.buffer
         # run test
         DeepEPTest._test_low_latency_main(
-            (args["max_generate_batch_size"] + params.tp_size - 1) // params.tp_size,
+            (args["max_generate_batch_size"] + config_adapter.tp_size - 1) // config_adapter.tp_size,
             deep_ep_wrapper.hidden_size,
             deep_ep_wrapper.num_experts,
             deep_ep_wrapper.num_topk,
@@ -1952,51 +1962,71 @@ class DeepEPTest(TestCase):
         os.environ["ACCL_TOPO_FIX"] = "1"
         os.environ["ACCL_LOAD_BALANCE"] = "1"
         # init params
-        params = GptInitModelParameters(
-            head_num=2,
-            size_per_head=128,
-            layer_num=2,
-            max_seq_len=2048,
-            vocab_size=500000,
-        )
-        params.nccl_ip = "127.0.0.1"
-        params.th_nccl_port = int(os.getenv("MASTER_PORT", "8376"))
-        params.dp_rank = rank
-        params.dp_size = num_ranks
-        params.tp_rank = 0
-        params.tp_size = 1
-        params.ep_size = num_ranks
-        params.ep_rank = rank
-        params.world_size = num_ranks
-        params.local_rank = rank
-        params.moe_config.use_deepep_low_latency = True
-        params.moe_config.use_deepep_internode = False
-        params.gpt_init_params.ffn_disaggregate_config.enable_ffn_disaggregate = True
-        params.moe_k = args["moe_k"]
-        params.expert_num = args["expert_num"]
-        params.hidden_size = args["hidden_size"]
-        params.max_generate_batch_size = args["max_generate_batch_size"]
-        params.gpt_init_params.ffn_disaggregate_config.attention_dp_size = (
-            num_ranks // 2
-        )
-        params.gpt_init_params.ffn_disaggregate_config.attention_tp_size = 1
-        params.gpt_init_params.ffn_disaggregate_config.ffn_dp_size = num_ranks // 2
-        params.gpt_init_params.ffn_disaggregate_config.ffn_tp_size = 1
+        config_adapter = DeepEPTest._create_deepep_config(rank, num_ranks, args, use_deepep_low_latency=True, enable_ffn_disaggregate=True)
         # init distributed environment
-        torch.cuda.set_device(params.local_rank)
-        torch.set_default_device(f"cuda:{params.local_rank}")
-        init_distributed_environment(params=params, backend="nccl", timeout=60)
-        init_deepep_wrapper(group=dist.group.WORLD, params=params)
+        torch.cuda.set_device(config_adapter.parallelism_config.local_rank)
+        torch.set_default_device(f"cuda:{config_adapter.parallelism_config.local_rank}")
+        init_distributed_environment(
+            parallelism_config=config_adapter.parallelism_config,
+            backend="nccl",
+            timeout=60
+        )
+        init_deepep_wrapper(
+            group=dist.group.WORLD,
+            config_adapter=config_adapter,
+        )
         deep_ep_wrapper = get_deepep_wrapper()
         buffer = deep_ep_wrapper.buffer
         # run test
+        DeepEPTest._test_low_latency_main(
+            (args["max_generate_batch_size"] + config_adapter.tp_size - 1) // config_adapter.tp_size,
+            deep_ep_wrapper.hidden_size,
+            deep_ep_wrapper.num_experts,
+            deep_ep_wrapper.num_topk,
+            deep_ep_wrapper.ep_rank,
+            deep_ep_wrapper.ep_size,
+            group,
+            buffer,
+            seed=1,
+        )
+        destroy_deepep_wrapper()
+        destroy_distributed_environment()
+
+    @staticmethod
+    def _run_deepep_low_latency_m2n_test(rank: int, num_ranks: int, args: Dict[str, Any]):
+        # set env
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_ranks))
+        os.environ["ACCL_DISPATCH_NUM_WARP_GROUPS"] = "4"
+        os.environ["ACCL_COMBINE_NUM_WARP_GROUPS"] = "4"
+        os.environ["ACCL_LOW_LATENCY_OPTIMIZE"] = "1"
+        os.environ["ACCL_TOPO_FIX"] = "1"
+        os.environ["ACCL_LOAD_BALANCE"] = "1"
+        # init params
+        config_adapter = DeepEPTest._create_deepep_config(rank, num_ranks, args, use_deepep_low_latency=True, enable_ffn_disaggregate=True)
+        # init distributed environment
+        torch.cuda.set_device(config_adapter.parallelism_config.local_rank)
+        torch.set_default_device(f"cuda:{config_adapter.parallelism_config.local_rank}")
+        init_distributed_environment(
+            parallelism_config=config_adapter.parallelism_config,
+            backend="nccl",
+            timeout=60
+        )
+        init_deepep_wrapper(
+            group=dist.group.WORLD,
+            config_adapter=config_adapter,
+        )
+
+        deep_ep_wrapper = get_deepep_wrapper()
+        buffer = deep_ep_wrapper.buffer
+        # run test
+        ffn_disaggregate_config = config_adapter.parallelism_config.ffn_disaggregate_config
         num_m = (
-            params.gpt_init_params.ffn_disaggregate_config.attention_dp_size
-            * params.gpt_init_params.ffn_disaggregate_config.attention_tp_size
+            ffn_disaggregate_config.attention_dp_size
+            * ffn_disaggregate_config.attention_tp_size
         )
         num_n = (
-            params.gpt_init_params.ffn_disaggregate_config.ffn_dp_size
-            * params.gpt_init_params.ffn_disaggregate_config.ffn_tp_size
+            ffn_disaggregate_config.ffn_dp_size
+            * ffn_disaggregate_config.ffn_tp_size
         )
         scale = num_ranks / num_n
         logical_num_experts = deep_ep_wrapper.num_experts * num_ranks // num_n
@@ -2004,7 +2034,7 @@ class DeepEPTest(TestCase):
             scale,
             num_m,
             num_m,
-            (args["max_generate_batch_size"] + params.tp_size - 1) // params.tp_size,
+            (args["max_generate_batch_size"] + config_adapter.tp_size - 1) // config_adapter.tp_size,
             deep_ep_wrapper.hidden_size,
             logical_num_experts,
             deep_ep_wrapper.num_topk,
@@ -2022,35 +2052,22 @@ class DeepEPTest(TestCase):
         # set env
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(num_ranks))
         # init params
-        params = GptInitModelParameters(
-            head_num=2,
-            size_per_head=128,
-            layer_num=2,
-            max_seq_len=2048,
-            vocab_size=500000,
-        )
-        params.nccl_ip = "127.0.0.1"
-        params.th_nccl_port = int(os.getenv("MASTER_PORT", "8376"))
-        params.dp_rank = rank
-        params.dp_size = num_ranks
-        params.tp_rank = 0
-        params.tp_size = 1
-        params.ep_size = num_ranks
-        params.ep_rank = rank
-        params.world_size = num_ranks
-        params.local_rank = rank
-        params.moe_config.use_deepep_low_latency = False
-        params.moe_config.use_deepep_internode = False
-        params.gpt_init_params.ffn_disaggregate_config.enable_ffn_disaggregate = False
-        params.moe_config.deep_ep_num_sm = 24
-        params.moe_k = 2
-        params.expert_num = 4
-        params.hidden_size = 128
+        args = {"moe_k": 2, "expert_num": 4, "hidden_size": 128}
+        config_adapter = DeepEPTest._create_deepep_config(rank, num_ranks, args, use_deepep_low_latency=False, enable_ffn_disaggregate=False)
         # init distributed environment
-        torch.cuda.set_device(params.local_rank)
-        torch.set_default_device(f"cuda:{params.local_rank}")
-        init_distributed_environment(params=params, backend="nccl", timeout=60)
-        init_deepep_wrapper(group=dist.group.WORLD, params=params)
+
+        torch.cuda.set_device(config_adapter.parallelism_config.local_rank)
+        torch.set_default_device(f"cuda:{config_adapter.parallelism_config.local_rank}")
+        init_distributed_environment(
+            parallelism_config=config_adapter.parallelism_config,   
+            backend="nccl",
+            timeout=60
+        )
+        init_deepep_wrapper(
+            group=dist.group.WORLD,
+            config_adapter=config_adapter,
+        )
+
         deep_ep_wrapper = get_deepep_wrapper()
         buffer = deep_ep_wrapper.buffer
         # run test
@@ -2080,40 +2097,25 @@ class DeepEPTest(TestCase):
         os.environ["ACCL_TOPO_FIX"] = "1"
         os.environ["ACCL_LOAD_BALANCE"] = "1"
         # init params
-        params = GptInitModelParameters(
-            head_num=2,
-            size_per_head=128,
-            layer_num=2,
-            max_seq_len=2048,
-            vocab_size=500000,
-        )
-        params.nccl_ip = "127.0.0.1"
-        params.th_nccl_port = int(os.getenv("MASTER_PORT", "8376"))
-        params.dp_rank = rank
-        params.dp_size = num_ranks
-        params.tp_rank = 0
-        params.tp_size = 1
-        params.ep_size = num_ranks
-        params.ep_rank = rank
-        params.world_size = num_ranks
-        params.local_rank = rank
-        params.moe_config.use_deepep_low_latency = True
-        params.moe_config.use_deepep_internode = False
-        params.gpt_init_params.ffn_disaggregate_config.enable_ffn_disaggregate = False
-        params.moe_k = args["moe_k"]
-        params.expert_num = args["expert_num"]
-        params.hidden_size = args["hidden_size"]
-        params.max_generate_batch_size = args["max_generate_batch_size"]
+        config_adapter = DeepEPTest._create_deepep_config(rank, num_ranks, args, use_deepep_low_latency=True, enable_ffn_disaggregate=False)
         # init distributed environment
-        torch.cuda.set_device(params.local_rank)
-        torch.set_default_device(f"cuda:{params.local_rank}")
-        init_distributed_environment(params=params, backend="nccl", timeout=60)
-        init_deepep_wrapper(group=dist.group.WORLD, params=params)
+
+        torch.cuda.set_device(config_adapter.parallelism_config.local_rank)
+        torch.set_default_device(f"cuda:{config_adapter.parallelism_config.local_rank}")
+        init_distributed_environment(
+            parallelism_config=config_adapter.parallelism_config,    
+            backend="nccl",
+            timeout=60
+        )
+        init_deepep_wrapper(
+            group=dist.group.WORLD,
+            config_adapter=config_adapter,
+        )
         deep_ep_wrapper = get_deepep_wrapper()
         buffer = deep_ep_wrapper.buffer
         # run test
         DeepEPTest._test_low_latency_per_token_quant_main(
-            (args["max_generate_batch_size"] + params.tp_size - 1) // params.tp_size,
+            (args["max_generate_batch_size"] + config_adapter.tp_size - 1) // config_adapter.tp_size,
             deep_ep_wrapper.hidden_size,
             deep_ep_wrapper.num_experts,
             deep_ep_wrapper.num_topk,

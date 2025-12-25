@@ -31,8 +31,6 @@ class ResponseInfo:
                 "reuse_len": 0,
                 "output_len": 500,
                 "step_output_len": 500,
-                "fallback_tokens": 0,
-                "fallback_times": 0,
                 "first_token_cost_time": 6129.027,
                 "wait_time": 5021.9,
                 "pd_sep": false,
@@ -57,7 +55,7 @@ class ResponseInfo:
         self.total_time = aux_info.get("cost_time", 0.0) - self.wait_time
         self.prefill_time = aux_info.get("first_token_cost_time", 0.0) - self.wait_time
         self.decode_time = self.total_time - self.prefill_time
-        self.decode_time_per_token = self.decode_time / (self.output_len - 1)
+        self.decode_time_per_token = self.decode_time / (self.output_len - 1) if self.output_len > 1 else 0.0
 
 
 @dataclass

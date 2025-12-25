@@ -4,7 +4,6 @@ from typing import Optional
 
 import torch
 
-from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
 from rtp_llm.models_py.modules.factory.linear import LinearBase
 from rtp_llm.ops.compute_ops import rtp_llm_ops
 
@@ -15,9 +14,11 @@ class RocmF16Linear(LinearBase):
     @classmethod
     def can_handle(
         cls,
-        config: Optional[GptInitModelParameters],
+        quant_config: object,
         weight: torch.Tensor,
         weight_scales: Optional[torch.Tensor],
+        weight_scale_2: Optional[torch.Tensor] = None,
+        input_scale: Optional[torch.Tensor] = None,
     ) -> bool:
         """Handle non-FP8 cases (no weight_scales)"""
         return weight_scales is None
@@ -28,9 +29,11 @@ class RocmF16Linear(LinearBase):
         weight_scales: Optional[torch.Tensor] = None,
         input_scales: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
-        config: Optional[GptInitModelParameters] = None,
+        quant_config: object = None,
+        weight_scale_2: Optional[torch.Tensor] = None,
     ):
-        super().__init__(weight, weight_scales, input_scales, bias, config)
+        super().__init__(weight, weight_scales, input_scales,
+                         bias, quant_config, weight_scale_2)
         self.weight = weight
         self.bias = bias
 

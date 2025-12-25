@@ -9,8 +9,6 @@ from typing import Optional
 import torch
 from torch import nn
 
-from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
-
 
 class LinearBase(nn.Module, ABC):
     """Linear strategy base class
@@ -23,16 +21,20 @@ class LinearBase(nn.Module, ABC):
     @abstractmethod
     def can_handle(
         cls,
-        config: Optional[GptInitModelParameters],
+        quant_config: object,
         weight: torch.Tensor,
         weight_scales: Optional[torch.Tensor],
+        weight_scale_2: Optional[torch.Tensor] = None,
+        input_scale: Optional[torch.Tensor] = None,
     ) -> bool:
         """Determine whether this strategy can handle the given configuration
 
         Args:
-            config: Model initialization parameters (can be None for non-FP8)
+            quant_config: Quantization configuration (required)
             weight: Weight tensor
             weight_scales: Weight scales tensor (None for non-FP8)
+            weight_scale_2: Second weight scale tensor (for NVFP4, can be None)
+            input_scale: Input scale tensor (for NVFP4, can be None)
 
         Returns:
             Whether this configuration can be handled
@@ -46,7 +48,8 @@ class LinearBase(nn.Module, ABC):
         weight_scales: Optional[torch.Tensor] = None,
         input_scales: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
-        config: Optional[GptInitModelParameters] = None,
+        quant_config: object = None,
+        weight_scale_2: Optional[torch.Tensor] = None,
     ):
         """Initialize the Linear module with weights
 
@@ -55,7 +58,8 @@ class LinearBase(nn.Module, ABC):
             weight_scales: Weight scales tensor
             input_scales: Input scales tensor
             bias: Bias tensor
-            config: Model initialization parameters
+            quant_config: Quantization configuration (required)ers
+            weight_scale_2: Second weight scale tensor (for FP4, can be None)
         """
         super().__init__()
 

@@ -10,11 +10,14 @@
 #include "rtp_llm/models_py/bindings/cuda/FusedMoEOp.h"
 #include "rtp_llm/models_py/bindings/cuda/SelectTopkOp.h"
 #include "rtp_llm/models_py/bindings/cuda/GroupTopKOp.h"
-#include "rtp_llm/models_py/bindings/common/RtpProcessGroup.h"
+// RtpProcessGroup is deprecated, use rtp_llm.distribute.collective_torch instead
+// #include "rtp_llm/models_py/bindings/common/RtpProcessGroup.h"
 #include "rtp_llm/models_py/bindings/cuda/PerTokenGroupQuantFp8.h"
 #include "rtp_llm/models_py/bindings/cuda/MoETopkSoftmax.h"
 #include "3rdparty/flashinfer/flashinfer.h"
 #include "rtp_llm/models_py/bindings/cuda/TrtFp8QuantOp.h"
+#include "rtp_llm/models_py/bindings/cuda/ReuseKVCacheOp.h"
+#include "rtp_llm/models_py/bindings/cuda/MlaKMergeOp.h"
 
 using namespace rtp_llm;
 
@@ -111,6 +114,20 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("fp8_max"),
                   py::arg("scale_ue8m0"));
 
+    rtp_ops_m.def("per_token_group_quant_fp8_v2",
+                  &per_token_group_quant_fp8_v2,
+                  "Fp8 Gemm Per Token Group",
+                  py::arg("input"),
+                  py::arg("output_q"),
+                  py::arg("output_s"),
+                  py::arg("group_size"),
+                  py::arg("eps"),
+                  py::arg("fp8_min"),
+                  py::arg("fp8_max"),
+                  py::arg("scale_ue8m0"),
+                  py::arg("fuse_silu_and_mul"),
+                  py::arg("masked_m"));
+
     rtp_ops_m.def("moe_topk_softmax",
                   &moe_topk_softmax,
                   "MoE Topk Softmax kernel",
@@ -132,6 +149,26 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("combo_tokens_type_ids"),
                   py::arg("token_type_embedding"),
                   py::arg("input_embedding_scalar") = 1.0f);
+
+    rtp_ops_m.def("reuse_kv_cache_indexed_batched",
+                  &rtp_llm::ReuseKVCacheIndexedBatched,
+                  "Reuse KV cache indexed batched kernel",
+                  py::arg("final_compressed_kv"),
+                  py::arg("final_k_pe"),
+                  py::arg("compressed_kv"),
+                  py::arg("k_pe"),
+                  py::arg("kv_cache_base"),
+                  py::arg("reuse_cache_page_indice"),
+                  py::arg("batch_reuse_info_vec"),
+                  py::arg("qo_indptr"),
+                  py::arg("tokens_per_block"));
+
+    rtp_ops_m.def("mla_k_merge",
+                  &rtp_llm::MlaKMerge,
+                  "Fused kernel to merge k_nope and k_pe efficiently",
+                  py::arg("k_out"),
+                  py::arg("k_nope"),
+                  py::arg("k_pe"));
 
     // CUDA Graph Copy Kernel Functions
     rtp_ops_m.def("cuda_graph_copy_small2large",
@@ -164,7 +201,8 @@ void registerBaseCudaBindings(py::module& rtp_ops_m) {
     registerFusedMoEOp(rtp_ops_m);
     registerSelectTopkOp(rtp_ops_m);
     registerGroupTopKOp(rtp_ops_m);
-    registerRtpProcessGroup(rtp_ops_m);
+    // RtpProcessGroup is deprecated, use rtp_llm.distribute.collective_torch instead
+    // registerRtpProcessGroup(rtp_ops_m);
     registerTrtFp8QuantOp(rtp_ops_m);
 }
 

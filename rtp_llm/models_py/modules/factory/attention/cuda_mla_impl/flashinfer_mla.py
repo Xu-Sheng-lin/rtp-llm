@@ -4,23 +4,26 @@ import torch
 
 # import flashinfer
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from flashinfer import (
     BatchMLAPagedAttentionWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
 )
+
 from flashinfer.jit import gen_batch_mla_module, gen_batch_prefill_module
 from flashinfer.utils import is_sm90a_supported
 
-from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
+from rtp_llm.models_py.utils.arch import is_cuda
 from rtp_llm.models_py.modules.factory.linear.factory import LinearFactory
 from rtp_llm.models_py.modules.factory.attention.mla_utils import check_attention_inputs
 
 # from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
 from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs, rtp_llm_ops
+from rtp_llm.ops import AttentionConfigs
 from rtp_llm.utils.model_weight import W
 
 g_workspace_buffer = None
-
 
 def warmup_flashinfer_python():
     modules = []
@@ -63,7 +66,7 @@ def warmup_flashinfer_python():
 class MlaFlashInferPrefillOp(object):
     def __init__(
         self,
-        config: GptInitModelParameters,  # for LinearFactory
+        attn_configs: AttentionConfigs,
         num_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -73,11 +76,13 @@ class MlaFlashInferPrefillOp(object):
         use_mla: bool,
         weights: List[Dict[str, torch.Tensor]] | None,
         use_trt_fmha: bool = False,
+        quant_config: Optional[object] = None,
     ):
         super().__init__()
         if weights is None:
             raise Exception(f"MlaAbsorbAttention need weights but got none")
-        self.config = config
+        self.attn_configs = attn_configs
+        self.quant_config = quant_config
         self.num_heads = num_heads
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -98,7 +103,7 @@ class MlaFlashInferPrefillOp(object):
         if use_trt_fmha:
             from rtp_llm.ops.compute_ops import TRTAttnOp
 
-            self.prefill_wrapper = TRTAttnOp(self.config)
+            self.prefill_wrapper = TRTAttnOp(attn_configs)
             return
 
         self.prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
@@ -117,6 +122,16 @@ class MlaFlashInferPrefillOp(object):
             attention_inputs.kv_cache_block_id_host,
             self.token_per_block,
         )
+        self.plan(mla_params)
+        # for reuse cache indexed batched
+        self.reuse_cache_page_indice = mla_params.reuse_cache_page_indice
+        self.qo_indptr = mla_params.qo_indptr
+        self.batch_reuse_info_vec = mla_params.batch_reuse_info_vec
+        if self.use_trt_fmha:
+            return self.prefill_wrapper.prepare(attention_inputs)
+        return mla_params
+
+    def plan(self, mla_params: Any):
         self.prefill_wrapper.plan(
             mla_params.qo_indptr,
             mla_params.prefill_page_indptr,
@@ -130,13 +145,6 @@ class MlaFlashInferPrefillOp(object):
             q_data_type=torch.bfloat16,
             kv_data_type=torch.bfloat16,
         )
-        # for reuse cache indexed batched
-        self.reuse_cache_page_indice = mla_params.reuse_cache_page_indice
-        self.qo_indptr = mla_params.qo_indptr
-        self.batch_reuse_info_vec = mla_params.batch_reuse_info_vec
-        if self.use_trt_fmha:
-            return self.prefill_wrapper.prepare(attention_inputs)
-        return mla_params
 
     def _reuse_kv_cache_indexed_batched(
         self,
@@ -144,85 +152,78 @@ class MlaFlashInferPrefillOp(object):
         k_pe: torch.Tensor,
         kv_cache: Optional[KVCache],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """使用索引操作的优化版本 - 根据kv_len和q_len的差值确定concat位置"""
+        """使用融合 CUDA kernel 的优化版本"""
 
-        # 获取参数
-        reuse_cache_page_indice = self.reuse_cache_page_indice  # [5, 3]
-        num_blocks = reuse_cache_page_indice.size(0)  # 2
+        reuse_cache_page_indice = self.reuse_cache_page_indice
+        num_blocks = 0
+        if reuse_cache_page_indice is not None:
+            num_blocks = reuse_cache_page_indice.size(0)
 
         if num_blocks == 0:
             return compressed_kv, k_pe
 
         compressed_kv_dim = compressed_kv.size(1)
-        qo_indptr = self.qo_indptr  # [0, 17, 29, 47, 63]
+        qo_indptr = self.qo_indptr
+        batch_reuse_info = self.batch_reuse_info_vec
 
-        # 准备结果tensor
-        batch_reuse_info = self.batch_reuse_info_vec.cpu().tolist()
-        qo_indptr_list = qo_indptr.cpu().tolist()
-        total_reuse_len = sum(info[1] for info in batch_reuse_info)
+        # 计算总长度
+        total_reuse_len = num_blocks * self.token_per_block
         if total_reuse_len == 0:
             return compressed_kv, k_pe
 
-        # 创建最终的tensor
+        total_final_len = compressed_kv.size(0) + total_reuse_len
+
+        # 创建输出 tensor
         final_compressed_kv = torch.empty(
-            (compressed_kv.size(0) + total_reuse_len, compressed_kv.size(1)),
+            (total_final_len, compressed_kv_dim),
             dtype=compressed_kv.dtype,
             device=compressed_kv.device,
         )
         final_k_pe = torch.empty(
-            (k_pe.size(0) + total_reuse_len, k_pe.size(1)),
+            (total_final_len, k_pe.size(1)),
             dtype=k_pe.dtype,
             device=k_pe.device,
         )
 
-        # 按batch处理，将reuse cache和compressed_kv按正确位置concat
-        compressed_kv_offset = 0
-        final_offset = 0
-
-        for (
-            batch_idx,
-            reuse_len,
-            block_start_idx,
-            blocks_needed,
-        ) in batch_reuse_info:
-            batch_q_len = qo_indptr_list[batch_idx + 1] - qo_indptr_list[batch_idx]
-
-            if reuse_len > 0:
-                # 获取这个batch需要的reuse blocks
-                batch_cache_indices = reuse_cache_page_indice[
-                    block_start_idx : block_start_idx + blocks_needed
-                ]
-
-                # 从kv_cache中获取对应的blocks
-                batch_cache_blocks = kv_cache.k_cache_base[batch_cache_indices]
-                batch_cache_blocks = batch_cache_blocks.view(
-                    -1, batch_cache_blocks.size(-1)
-                )
-
-                # 将reuse cache放到最终tensor的前面部分
-                final_compressed_kv[final_offset : final_offset + reuse_len] = (
-                    batch_cache_blocks[:, :compressed_kv_dim]
-                )
-                final_k_pe[final_offset : final_offset + reuse_len] = (
-                    batch_cache_blocks[:, compressed_kv_dim:]
-                )
-                final_offset += reuse_len
-
-            # 将当前batch的compressed_kv放到对应位置
-            batch_compressed_kv_start = compressed_kv_offset
-            batch_compressed_kv_end = compressed_kv_offset + batch_q_len
-
-            final_compressed_kv[final_offset : final_offset + batch_q_len] = (
-                compressed_kv[batch_compressed_kv_start:batch_compressed_kv_end]
-            )
-            final_k_pe[final_offset : final_offset + batch_q_len] = k_pe[
-                batch_compressed_kv_start:batch_compressed_kv_end
-            ]
-
-            final_offset += batch_q_len
-            compressed_kv_offset += batch_q_len
-
+        # 调用融合 kernel
+        k_pe = k_pe.contiguous()
+        rtp_llm_ops.reuse_kv_cache_indexed_batched(
+            final_compressed_kv,
+            final_k_pe,
+            compressed_kv,
+            k_pe,
+            kv_cache.k_cache_base,
+            reuse_cache_page_indice,
+            batch_reuse_info,
+            qo_indptr,
+            self.token_per_block,
+        )
         return final_compressed_kv, final_k_pe
+
+    def _concat_and_cast_mha_k(self, k_nope, k_pe):
+        # Temporary for DeepSeek V3/R1 only, but can generalize if needed
+        k_shape = (
+            k_nope.shape[0],
+            self.num_heads,
+            self.qk_nope_head_dim + self.qk_rope_head_dim,
+        )
+        if (
+            is_cuda()
+            and (self.num_heads == 128)
+            and (self.qk_nope_head_dim == 128)
+            and (self.qk_rope_head_dim == 64)
+        ):
+            k = k_nope.new_empty(*k_shape)
+            rtp_llm_ops.mla_k_merge(k, k_nope, k_pe)
+        elif is_cuda():
+            attn_dtype = k_nope.dtype
+            k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
+            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        else:
+            k = k_nope.new_empty(*k_shape)
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
+        return k
 
     def forward(
         self,
@@ -242,11 +243,13 @@ class MlaFlashInferPrefillOp(object):
 
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         self.k_nope_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None, self.config
+            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None,
+            self.quant_config
         )
 
         self.v_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None, self.config
+            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None,
+            self.quant_config
         )
 
         k_nope = self.k_nope_proj(compressed_kv)
@@ -254,12 +257,7 @@ class MlaFlashInferPrefillOp(object):
 
         k_nope = k_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
         value_states = value_states.view(-1, self.num_heads, self.qk_nope_head_dim)
-
-        k = k_pe.new_empty(
-            k_pe.size(0), self.num_heads, self.qk_rope_head_dim + self.qk_nope_head_dim
-        )
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
+        k = self._concat_and_cast_mha_k(k_nope, k_pe)
 
         if self.use_trt_fmha:
             pad_len = self.qk_rope_head_dim
@@ -339,6 +337,10 @@ class MlaFlashInferDecodeOp(object):
             attention_inputs.kv_cache_block_id_host,
             self.token_per_block,
         )
+        self.plan(fmha_params)
+        return fmha_params
+
+    def plan(self, fmha_params: Any):
         self.mla_wrapper.plan(
             fmha_params.qo_indptr,
             fmha_params.decode_page_indptr,
@@ -353,7 +355,6 @@ class MlaFlashInferDecodeOp(object):
             torch.bfloat16,
             torch.bfloat16,
         )
-        return fmha_params
 
     def forward(
         self,
@@ -413,13 +414,15 @@ class MlaFlashInferDecodeOp(object):
 class TrtV2PrefillAttentionOp(object):
     def __init__(
         self,
-        config: GptInitModelParameters,
+        attn_configs: AttentionConfigs,
         num_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         qk_nope_head_dim: int,
         use_mla: bool,
         weights: List[Dict[str, torch.Tensor]] | None,
+        fmha_config,
+        quant_config: Optional[object] = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -427,14 +430,21 @@ class TrtV2PrefillAttentionOp(object):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_nope_head_dim = qk_nope_head_dim
         self.scale = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
-        self.config = config
+        self.attn_configs = attn_configs
+        self.quant_config = quant_config
         self.weights = weights
-        self.use_mla = use_mla
+        self.use_mla = use_mla   
+        # Get FMHAConfig - will check in support() method
+        self.fmha_config = fmha_config
+        
         from rtp_llm.ops.compute_ops import TRTAttnOp
 
-        self.fmha_impl = TRTAttnOp(self.config)
+        self.fmha_impl = TRTAttnOp(attn_configs)
 
     def support(self, attention_inputs: PyAttentionInputs):
+        # Check if TRT FMHA is enabled
+        if not self.fmha_config.enable_paged_trt_fmha:
+            return False
         return (
             self.use_mla
             and attention_inputs.is_prefill
@@ -454,11 +464,13 @@ class TrtV2PrefillAttentionOp(object):
     ) -> torch.Tensor:
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         self.k_nope_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None, self.config
+            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None, 
+            self.quant_config
         )
 
         self.v_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None, self.config
+            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None,
+            self.quant_config
         )
 
         k_nope = self.k_nope_proj(compressed_kv)
@@ -498,7 +510,7 @@ class TrtV2PrefillAttentionOp(object):
 class TrtV2PrefillAttention(nn.Module):
     def __init__(
         self,
-        config: GptInitModelParameters,
+        attn_configs: AttentionConfigs,
         num_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -518,7 +530,7 @@ class TrtV2PrefillAttention(nn.Module):
         self.scale = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
         self.v_weight = v_weight
         self.k_nope_weight = k_nope_weight
-        self.config = config
+        self.attn_configs = attn_configs
     def forward(
         self,
         q_nope: torch.Tensor,
@@ -544,7 +556,8 @@ class TrtV2PrefillAttention(nn.Module):
         pad_len = self.qk_rope_head_dim
         value_states = F.pad(value_states, (0, pad_len))
         from rtp_llm.ops.compute_ops import TRTAttnOp
-        self.fmha_impl = TRTAttnOp(self.config)
+
+        self.fmha_impl = TRTAttnOp(self.attn_configs)
         self.support_: bool = self.fmha_impl.support(attention_inputs)
         if self.support_:
             self.fmha_params = self.fmha_impl.prepare(attention_inputs)

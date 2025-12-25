@@ -72,19 +72,10 @@ class DeviceExporter:
     def get_device_type(self) -> DeviceType:
         ...
 
-    def pack_int8_tensor_to_packed_int4(self, weight: torch.Tensor) -> torch.Tensor:
-        ...
-
     def preprocess_gemm_weight_by_key(self, key: str, weight: torch.Tensor, user_arm_gemm_use_kai: bool) -> torch.Tensor:
         ...
 
     def preprocess_weight_scale(self, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        ...
-
-    def preprocess_weights_for_mixed_gemm(self, weight: torch.Tensor, quant_type: typing.Any, arch: str) -> torch.Tensor:
-        ...
-
-    def symmetric_quantize_last_axis_of_batched_matrix(self, weight: torch.Tensor, quant_type: typing.Any, arch: str) -> list[torch.Tensor]:
         ...
 
     def update_current_torch_stream(self) -> None:
@@ -204,7 +195,7 @@ class KVCache:
         ...
 
 
-class MlaParams:
+class MlaParams(ParamsBase):
     def __init__(self) -> None:
         ...
 
@@ -262,7 +253,6 @@ class ParamsBase:
 class PyAttentionInputs:
     cache_store_inputs: PyCacheStoreInputs | None
     cu_seqlens: torch.Tensor
-    cu_seqlens_without_prefix: torch.Tensor
     dtype: TypeMeta
     input_lengths: torch.Tensor
     is_prefill: bool
@@ -419,5 +409,5 @@ def get_typemeta(arg0: torch.Tensor) -> TypeMeta:
     """
 
 
-def init_device(params: libth_transformer_config.GptInitParameter) -> None:
+def init_device(parallelism_config: libth_transformer_config.ParallelismConfig, model_config: libth_transformer_config.ModelConfig, eplb_config: libth_transformer_config.EPLBConfig, fmha_config: libth_transformer_config.FMHAConfig, device_resource_config: libth_transformer_config.DeviceResourceConfig, moe_config: libth_transformer_config.MoeConfig, sp_config: libth_transformer_config.SpeculativeExecutionConfig, misc_config: libth_transformer_config.MiscellaneousConfig, profiling_debug_logging_config: libth_transformer_config.ProfilingDebugLoggingConfig, hw_kernel_config: libth_transformer_config.HWKernelConfig, concurrency_config: libth_transformer_config.ConcurrencyConfig, ffn_disaggregate_config: libth_transformer_config.FfnDisAggregateConfig, runtime_config: libth_transformer_config.RuntimeConfig) -> None:
     ...

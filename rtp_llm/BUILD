@@ -23,7 +23,12 @@ tensorrt = [
 ]
 
 flashinfer = [
+    "apache-tvm-ffi",
     "flashinfer-python",
+]
+
+deep_gemm = [
+    "deep_gemm",
 ]
 
 xft_dep = select({
@@ -104,7 +109,10 @@ requirement([
     "concurrent_log_handler",
     "aiter",
     "fastsafetensors",
-] + tensorrt + flashinfer)
+    "deep_ep",
+    "pytorch-triton-rocm",
+    "pybind11_stubgen",
+] + tensorrt + flashinfer + deep_gemm)
 
 filegroup(
     name = "cutlass_config",
@@ -182,6 +190,12 @@ py_library(
     srcs = glob([
         "device/**/*.py",
     ]),
+    deps = [
+        ":torch",
+        ":psutil",
+        ":utils",
+        ":ops",
+    ],
 )
 
 py_library(
@@ -216,10 +230,14 @@ py_library(
         "//rtp_llm/model_loader:loader",
         "//rtp_llm/models_py:models",
     ] + arch_dep + select({
-        "@//:using_cuda12_9_x86": tensorrt + flashinfer,
-        "@//:cuda_pre_12_9": tensorrt + flashinfer,
+        "@//:using_cuda": flashinfer + deep_gemm,
         "//conditions:default": []
     }) + select({
+        "@//:using_cuda12_9_x86": tensorrt,
+        "@//:cuda_pre_12_9": tensorrt,
+        "//conditions:default": []
+    }) +
+    select({
         "@//:using_arm": [],
         "@//:using_cuda12_arm": [],
         # "//:xft_use_icx": [
@@ -457,6 +475,7 @@ py_library(
             ":embedding",
             "//rtp_llm/tools/convert:convert",
             ":aiter",
+            ":pytorch-triton-rocm",
         ],
         "//conditions:default": [
             ":models",
@@ -465,7 +484,6 @@ py_library(
             "//rtp_llm/tools/convert:convert",
         ],
             }) + select({
-                "@//:using_cuda12": ["@deep_gemm_ext//:deep_gemm"],
                 "//conditions:default": [],
             }),
     data = [
@@ -561,7 +579,7 @@ whl_reqs = [
     "bitsandbytes",
     "portalocker",
     "concurrent_log_handler",
-    "flashinfer-python==0.2.5",
+    "apache-tvm-ffi==0.1.1",
 ] + whl_deps() + platform_deps() + xft_dep
 
 py_wheel(
@@ -617,6 +635,29 @@ py_wheel(
     ] + xft_dep + arch_with_version_dep,
 )
 
+py_package(
+    name = "rtp_llm_deepgemm_pkg",
+    deps = select({
+        "@//:using_cuda12": ["@deep_gemm_ext//:deep_gemm"],
+        "//conditions:default": [],
+    }),
+    packages = [
+        "deep_gemm",
+    ],
+)
+
+py_wheel(
+    name = "rtp_llm_deepgemm_whl",
+    distribution = "rtp_llm_deep_gemm",
+    python_tag = "py3",
+    tags = ["manual", "local", "no-remote"],
+    version = RELEASE_VERSION,
+    deps = [
+        ":rtp_llm_deepgemm_pkg",
+    ],
+    requires = [],
+)
+
 rename_wheel_aarch64(
     name = "rtp_llm_aarch64",
     package_name = "rtp_llm-%s" % RELEASE_VERSION,
@@ -645,6 +686,7 @@ py_library(
     deps = [
         ":rtp_llm_lib",
         "//rtp_llm/test/utils:bench_util",
+        "//rtp_llm/test/utils:numeric_util",
         "//rtp_llm/test/utils:port_util",
         "//rtp_llm/test/utils:device_resource",
         "//rtp_llm/test/utils:stream_util",

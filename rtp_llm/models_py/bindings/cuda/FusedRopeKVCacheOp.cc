@@ -9,8 +9,8 @@
 
 namespace rtp_llm {
 
-FusedRopeKVCachePrefillOp::FusedRopeKVCachePrefillOp(const GptInitParameter& gpt_init_parameter):
-    FMHACudaBase(gpt_init_parameter) {}
+FusedRopeKVCachePrefillOp::FusedRopeKVCachePrefillOp(const AttentionConfigs& attn_configs):
+    attn_configs_(attn_configs), device_(dynamic_cast<CudaDevice*>(DeviceFactory::getDefaultDevice())) {}
 
 TRTAttnPtr FusedRopeKVCachePrefillOp::prepare(torch_ext::PyAttentionInputs attn_inputs) {
     int       batch_size = attn_inputs.input_lengths.size(0);
@@ -20,9 +20,8 @@ TRTAttnPtr FusedRopeKVCachePrefillOp::prepare(torch_ext::PyAttentionInputs attn_
         kv_cache_block_id_device = torchTensor2Buffer(attn_inputs.kv_cache_block_id_device);
     }
     // not support has_alibi_slopes
-    auto          cu_seqlens                = attn_inputs.cu_seqlens;
-    auto          cu_seqlens_without_prefix = attn_inputs.cu_seqlens_without_prefix;
-    torch::Tensor cu_kv_seqlens             = cu_seqlens;
+    auto          cu_seqlens    = attn_inputs.cu_seqlens;
+    torch::Tensor cu_kv_seqlens = cu_seqlens;
     TRTAttnPtr    attn_params;
     auto          params =
         device_->prepareTrtAttn(attn_configs_, attn_inputs.kv_block_offset, kv_cache_block_id_device, batch_size);
@@ -33,7 +32,6 @@ TRTAttnPtr FusedRopeKVCachePrefillOp::prepare(torch_ext::PyAttentionInputs attn_
     }
     attn_params->attn_type                 = torchDTypeToDataType(attn_inputs.dtype);
     attn_params->cu_seqlens                = cu_seqlens;
-    attn_params->cu_seqlens_without_prefix = cu_seqlens_without_prefix;
     attn_params->cu_kv_seqlens             = cu_kv_seqlens;
     attn_params->max_seq_len               = attn_inputs.input_lengths.max().item<int32_t>();
     attn_params->kv_block_array.cache_type = attn_configs_.kv_cache_dtype;
@@ -113,7 +111,6 @@ torch::Tensor FusedRopeKVCachePrefillOp::forward(const torch::Tensor&           
                   // params.weights.qkv_weight->bias->data() : nullptr,
         padding_offset,
         params->cu_seqlens.data_ptr<int>(),
-        params->cu_seqlens_without_prefix.data_ptr<int>(),
         rope_cache.used,
         checkRopeCache(attn_configs_.rope_config, rope_cache) ? rope_cache.data.data_ptr<float>() : nullptr,
         batch_size,
@@ -145,8 +142,8 @@ torch::Tensor FusedRopeKVCachePrefillOp::forward(const torch::Tensor&           
     }
 }
 
-FusedRopeKVCacheDecodeOp::FusedRopeKVCacheDecodeOp(const GptInitParameter& gpt_init_parameter):
-    FMHACudaBase(gpt_init_parameter) {}
+FusedRopeKVCacheDecodeOp::FusedRopeKVCacheDecodeOp(const AttentionConfigs& attn_configs):
+    attn_configs_(attn_configs), device_(dynamic_cast<CudaDevice*>(DeviceFactory::getDefaultDevice())) {}
 
 TRTAttnPtr FusedRopeKVCacheDecodeOp::prepare(torch_ext::PyAttentionInputs attn_inputs) {
     int       batch_size = attn_inputs.sequence_lengths.size(0);
@@ -156,11 +153,9 @@ TRTAttnPtr FusedRopeKVCacheDecodeOp::prepare(torch_ext::PyAttentionInputs attn_i
         kv_cache_block_id_device = torchTensor2Buffer(attn_inputs.kv_cache_block_id_device);
     }
     // not support has_alibi_slopes
-    attn_inputs.cu_seqlens.slice(0, 1, batch_size + 1)                = attn_inputs.input_lengths.cumsum(0);
-    attn_inputs.cu_seqlens_without_prefix.slice(0, 1, batch_size + 1) = attn_inputs.input_lengths.cumsum(0);
-    auto          cu_seqlens                                          = attn_inputs.cu_seqlens;
-    auto          cu_seqlens_without_prefix                           = attn_inputs.cu_seqlens_without_prefix;
-    torch::Tensor cu_kv_seqlens                                       = cu_seqlens;
+    attn_inputs.cu_seqlens.slice(0, 1, batch_size + 1) = attn_inputs.input_lengths.cumsum(0);
+    auto          cu_seqlens                           = attn_inputs.cu_seqlens;
+    torch::Tensor cu_kv_seqlens                        = cu_seqlens;
     TRTAttnPtr    attn_params;
     auto          params = device_->prepareTrtAttn(
         attn_configs_, attn_inputs.kv_block_offset, kv_cache_block_id_device, attn_inputs.sequence_lengths.size(0));
@@ -169,7 +164,6 @@ TRTAttnPtr FusedRopeKVCacheDecodeOp::prepare(torch_ext::PyAttentionInputs attn_i
     attn_params->decode_plan               = true;
     attn_params->attn_type                 = torchDTypeToDataType(attn_inputs.dtype);
     attn_params->cu_seqlens                = cu_seqlens;
-    attn_params->cu_seqlens_without_prefix = cu_seqlens_without_prefix;
     attn_params->cu_kv_seqlens             = cu_kv_seqlens;
     attn_params->sequence_lengths          = attn_inputs.sequence_lengths;
     attn_params->kv_block_array.cache_type = attn_configs_.kv_cache_dtype;
@@ -228,7 +222,7 @@ void registerFusedRopeKVCacheOp(const py::module& m) {
     pybind11::class_<KVBlockArray>(m, "KVBlockArray").def(pybind11::init<>());
     pybind11::class_<TRTAttn, std::shared_ptr<TRTAttn>, rtp_llm::ParamsBase>(m, "TRTAttn").def(pybind11::init<>());
     pybind11::class_<FusedRopeKVCachePrefillOp>(m, "FusedRopeKVCachePrefillOp")
-        .def(pybind11::init<GptInitParameter>(), py::arg("gpt_init_parameter"))
+        .def(pybind11::init<const AttentionConfigs&>(), py::arg("attn_configs"))
         .def("prepare", &FusedRopeKVCachePrefillOp::prepare, py::arg("attn_inputs"))
         .def("forward",
              &FusedRopeKVCachePrefillOp::forward,
@@ -238,7 +232,7 @@ void registerFusedRopeKVCacheOp(const py::module& m) {
              py::arg("params"));
 
     pybind11::class_<FusedRopeKVCacheDecodeOp>(m, "FusedRopeKVCacheDecodeOp")
-        .def(pybind11::init<GptInitParameter>(), py::arg("gpt_init_parameter"))
+        .def(pybind11::init<const AttentionConfigs&>(), py::arg("attn_configs"))
         .def("prepare", &FusedRopeKVCacheDecodeOp::prepare, py::arg("attn_inputs"))
         .def("forward",
              &FusedRopeKVCacheDecodeOp::forward,

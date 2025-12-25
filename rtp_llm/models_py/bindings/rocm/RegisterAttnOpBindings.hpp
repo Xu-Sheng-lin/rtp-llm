@@ -4,7 +4,8 @@
 #include "rtp_llm/models_py/bindings/rocm/PagedAttn.h"
 #include "rtp_llm/cpp/kernels/mla_kernels_rocm/page_hip.h"
 #include "rtp_llm/cpp/kernels/mla_kernels_rocm/rope_hip.h"
-namespace torch_ext {
+
+namespace rtp_llm {
 
 void registerMlaAttnOpBindings(py::module& rtp_ops_m) {
     rtp_ops_m.def("apply_rope_pos_ids_cos_sin_cache",
@@ -40,4 +41,4 @@ void registerAttnOpBindings(py::module& rtp_ops_m) {
     registerMlaAttnOpBindings(rtp_ops_m);
 }
 
-}  // namespace torch_ext
+}  // namespace rtp_llm

@@ -86,7 +86,7 @@ multi_copy_script() {
         scp -P ${SSH_PORT} ${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/main_logs/process.log ${TASK_OUTPUT_DIR}/process_logs/process_${TEST_OUTPUT_NAME}.log;
         scp -P ${SSH_PORT} ${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/normal_* ${TASK_OUTPUT_DIR}/trace_files/;
         if [ $WORLD_RANK -eq 0 ]; then
-          scp -P ${SSH_PORT} ${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/Decode_Result.json ${TASK_OUTPUT_DIR}/Decode_Result.json;
+          scp -P ${SSH_PORT} ${RUN_USER}@${IP}:${TEST_OUTPUT_PATH}/*Result.json ${TASK_OUTPUT_DIR}/;
         fi
       ) &
       export WORLD_RANK=$((WORLD_RANK + 8));
@@ -162,7 +162,6 @@ multi_test_script() {
   # Export essential environment variables
   export BAZEL_BUILD_ARGS=${BAZEL_BUILD_ARGS:-" --jobs 64 --verbose_failures --config=cuda12_6 "}
   export FRONTEND_SERVER_COUNT=${FRONTEND_SERVER_COUNT:-16}
-  export LOAD_CKPT_NUM_PROCESS=${LOAD_CKPT_NUM_PROCESS:-64}
   export START_PORT=${START_PORT:-12333}
   export WARM_UP=${WARM_UP:-1}
   export RESERVER_RUNTIME_MEM_MB=${RESERVER_RUNTIME_MEM_MB:-0}

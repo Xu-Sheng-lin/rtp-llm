@@ -2,8 +2,12 @@ from typing import Any, Optional
 
 import torch
 
-from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
-from rtp_llm.distribute.collective import Group, all_reduce
+from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
+from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+    per_token_cast_to_fp8,
+    sgl_per_token_group_quant_fp8,
+)
+from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.modules.factory.fused_moe.defs.fused_moe import (
     ExpertForwardPayload,
     ExpertTokensMetadata,
@@ -13,9 +17,12 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
     FusedMoEQuantConfig,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
+
+from rtp_llm.models_py.kernels.cuda.fp8_kernel import scaled_fp8_per_token_quant
 from rtp_llm.models_py.triton_kernels.moe.ep_kernels import (
     recompute_topk_ids_sum_expert_count,
 )
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import MoEConfigAdapter
 from rtp_llm.ops.compute_ops import trt_fp8_quantize_128
 
 
@@ -25,7 +32,7 @@ class PureTpRouter(FusedMoeDataRouter):
         return RouterType.PURE_TP
 
     @classmethod
-    def check_conditions(cls, checker: Any, config: GptInitModelParameters) -> None:
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
         """Check if PureTpRouter can handle the configuration"""
         from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
             MoeConfigResolver,
@@ -36,7 +43,7 @@ class PureTpRouter(FusedMoeDataRouter):
 
     def __init__(
         self,
-        config: GptInitModelParameters,
+        config: MoEConfigAdapter,
         use_fp8: bool = True,
         async_mode: bool = False,
         expert_alignment: int = 128,
@@ -68,8 +75,19 @@ class PureTpRouter(FusedMoeDataRouter):
         quant_config: FusedMoEQuantConfig,
     ) -> ExpertForwardPayload:
         # recompute top_k ids to current expert, mask out of range expert to -1
-        if self.use_fp8:
-            expert_x, expert_x_scale = trt_fp8_quantize_128(a1, False)
+        if is_deep_gemm_e8m0_used():
+            expert_x, expert_x_scale = sgl_per_token_group_quant_fp8(
+                a1,
+                128,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+            )
+        elif self.use_fp8:
+            if quant_config.is_per_act_token:
+                expert_x, expert_x_scale = scaled_fp8_per_token_quant(a1, None)
+            else:
+                expert_x, expert_x_scale = trt_fp8_quantize_128(a1, False)
         else:
             expert_x = a1
             expert_x_scale = None
@@ -80,7 +98,7 @@ class PureTpRouter(FusedMoeDataRouter):
         )
         return ExpertForwardPayload(
             expert_x,
-            None,
+            a1.dtype,
             expert_x_scale,
             ExpertTokensMetadata(num_recv_tokens_per_expert, None),
             adjusted_topk_ids,

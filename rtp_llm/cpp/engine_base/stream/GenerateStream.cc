@@ -10,33 +10,33 @@
 #include "rtp_llm/cpp/core/Types.h"
 #include "rtp_llm/cpp/core/torch_utils/BufferTorchUtils.h"
 #include "rtp_llm/cpp/devices/DeviceFactory.h"
-#include "rtp_llm/cpp/config/GptInitParameter.h"
+#include "rtp_llm/cpp/config/ModelConfig.h"
 
 using namespace std;
 
 namespace rtp_llm {
 
 GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
-                               const rtp_llm::GptInitParameter& params,
-                               const ResourceContext&           resource_context,
-                               kmonitor::MetricsReporterPtr     metrics_reporter,
-                               size_t                           extra_reserve_token_num,
-                               bool                             perf_test):
+                               const ModelConfig&                model_config,
+                               const RuntimeConfig&               runtime_config,
+                               const ResourceContext&            resource_context,
+                               kmonitor::MetricsReporterPtr      metrics_reporter,
+                               size_t                             extra_reserve_token_num,
+                               bool                               perf_test):
     generate_input_(input),
-    max_seq_len_(params.max_seq_len_),
-    vocab_size_(params.vocab_size_),
+    max_seq_len_(model_config.max_seq_len),
+    vocab_size_(model_config.vocab_size),
     stream_cache_resource_(std::make_shared<StreamCacheResource>(
         this, resource_context, input->need_release_resource, input->generate_config->adapter_name)),
     need_release_resource_(input->need_release_resource),
-    enable_fast_gen_(params.enable_fast_gen_),
     gen_timeline_(input->generate_config->gen_timeline),
     metrics_reporter_(metrics_reporter),
-    special_tokens_(params.special_tokens_),
+    special_tokens_(model_config.special_tokens),
     output_mutex_(std::make_shared<std::mutex>()),
     cv_(std::make_shared<std::condition_variable>()),
-    mm_position_ids_style_(PositionIdsStyle(params.mm_position_ids_style_)),
-    dtype_(params.data_type_),
-    hidden_size_(params.hidden_size_) {
+    mm_position_ids_style_(PositionIdsStyle(model_config.mm_model_config.mm_position_ids_style)),
+    dtype_(model_config.data_type),
+    hidden_size_(model_config.hidden_size) {
     if (!updatePrefix(resource_context.system_prompt)) {
         return;
     }
@@ -67,11 +67,10 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
         setReturnLastHiddenStates(true);
     }
     complete_token_ids_ = std::make_shared<CompleteTokenIds>(
-        device_, init_batch_size, maxBatchSize(), max_seq_len_, params.seq_size_per_block_);
+        device_, init_batch_size, maxBatchSize(), max_seq_len_, model_config.attn_config.tokens_per_block);
     complete_token_ids_->init(input, extra_reserve_token_num);
 
     last_output_pos_ = seqLength();
-    max_chunk_len_   = seqLength();
 
     cum_log_probs_ =
         device_->allocateBuffer({rtp_llm::DataType::TYPE_FP32, {init_batch_size}, rtp_llm::AllocationType::HOST}, {});
@@ -91,7 +90,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     think_logits_processor_ptr_ = ThinkModeLogitsProcessor::fromGenerateInput(device_, generate_input_, maxBatchSize());
     tree_logits_processor_ptr_  = TreeLogitsProcessor::fromGenerateInput(device_, generate_input_, init_batch_size);
     multi_seq_logits_processor_ptr_ =
-        MultiSeqLogitsProcessor::fromGenerateInput(device_, generate_input_, special_tokens_.eos_token_id_);
+        MultiSeqLogitsProcessor::fromGenerateInput(device_, generate_input_, special_tokens_.eos_token_id);
 
     initializeLogitsProcessorList();
 }
@@ -121,43 +120,18 @@ const std::vector<int64_t>& GenerateStream::cacheKeys(int32_t batch_id) const {
     return stream_cache_resource_->cacheKeys(batch_id);
 }
 
-absl::StatusOr<int> GenerateStream::acquireCapacity(int token_capacity) {
-    if (token_capacity <= 0) {
-        return absl::InternalError("token_capacity is <= 0");
-    }
-    if (isChunkStream()) {
-        // TODO(xinfei.sxf) add min_chunk_len ?
-        if (current_chunk_len_ == 0) {
-            current_chunk_len_ = reuse_length_;
-        }
-        auto remaining_token = max_chunk_len_ - current_chunk_len_;
-        last_chunk_len_      = current_chunk_len_;
-        if (token_capacity > remaining_token) {
-            current_chunk_len_ = max_chunk_len_;
-            return remaining_token;
-        } else {
-            current_chunk_len_ += token_capacity;
-            return token_capacity;
-        }
-    } else if (!isContextStream()) {
-        return 1;
-    }
-    RTP_LLM_CHECK(false);
-    return absl::InternalError("unexpected call");
-}
-
 void GenerateStream::cancel() {
     setStop(ErrorCode::CANCELLED, "cancel stream");
 }
 
-absl::StatusOr<int> GenerateStream::initKVBlock(int token_capacity, size_t reserve_step) {
+absl::Status GenerateStream::initKVBlock(size_t reserve_step) {
     std::lock_guard<std::mutex> lock(*output_mutex_);
     if (generate_status_->status == StreamState::WAITING) {
         wait_time_us_ = autil::TimeUtility::currentTimeInMicroSeconds() - begin_time_us_;
     } else if (generate_status_->status == StreamState::PAUSED) {
         pause_time_us_ += autil::TimeUtility::currentTimeInMicroSeconds() - last_pause_us_;
     }
-    return stream_cache_resource_->initKVBlock(token_capacity, reserve_step);
+    return stream_cache_resource_->initKVBlock(reserve_step);
 }
 
 void GenerateStream::fakeInitKVBlock() {
@@ -165,16 +139,15 @@ void GenerateStream::fakeInitKVBlock() {
     stream_cache_resource_->fakeInitKVBlock();
 }
 
-absl::StatusOr<int> GenerateStream::incrKVBlock(int token_capacity, size_t reserve_step) {
+absl::Status GenerateStream::incrKVBlock(size_t reserve_step) {
     std::lock_guard<std::mutex> lock(*output_mutex_);
-    return stream_cache_resource_->incrKVBlock(token_capacity, reserve_step);
+    return stream_cache_resource_->incrKVBlock(reserve_step);
 }
 
 int GenerateStream::tryReleaseKVBlock(int nums) {
     std::lock_guard<std::mutex> lock(*output_mutex_);
     RTP_LLM_CHECK_WITH_INFO(nums >= 0, "release block nums is < 0");
     auto release_blocks = stream_cache_resource_->tryReleaseKVBlock(nums);
-    incrFallbackBlock(release_blocks);
     return release_blocks;
 }
 
@@ -189,11 +162,6 @@ void GenerateStream::setNeedReleaseResource(bool need_release_resource) {
 int GenerateStream::nextNeedBlockNums(size_t reserve_step) const {
     // TODO: maybe need fix when context and reuse
     return stream_cache_resource_->singleBatchNeedBlocks(seqLength() + reserve_step) * nextBatchSize();
-}
-
-void GenerateStream::incrFallbackBlock(int fallback_blocks) {
-    fallback_blocks_ += fallback_blocks;
-    fallback_times_ += 1;
 }
 
 std::shared_ptr<GenerateInput> GenerateStream::generateInput() const {
@@ -342,16 +310,6 @@ int GenerateStream::inputLength() const {
     return generate_input_->inputLength();
 }
 
-int GenerateStream::currentChunkLen() const {
-    return current_chunk_len_;
-}
-
-void GenerateStream::resetChunkLen(int chunk_len, int max_chunk_len) {
-    last_chunk_len_    = 0;
-    current_chunk_len_ = chunk_len;
-    max_chunk_len_     = max_chunk_len;
-}
-
 int GenerateStream::seqLength() const {
     return complete_token_ids_->seqLength();
 }
@@ -366,7 +324,7 @@ int GenerateStream::seqSizePerBlock() const {
 
 int GenerateStream::contextLength() const {
     int begin_pos = prefixLength();
-    int end_pos   = isChunkStream() ? currentChunkLen() : seqLength();
+    int end_pos   = seqLength();
     return end_pos - begin_pos;
 }
 
@@ -375,11 +333,6 @@ int GenerateStream::inputPrefixLength() const {
 }
 
 int GenerateStream::prefixLength() const {
-    if (fallback_prefix_length_) {
-        return fallback_prefix_length_;
-    } else if (last_chunk_len_) {
-        return last_chunk_len_;
-    }
     return reuse_length_;
 }
 
@@ -424,24 +377,12 @@ void GenerateStream::setInitialReuseLength(int initial_reuse_length) {
     initial_reuse_length_ = initial_reuse_length;
 }
 
-int GenerateStream::fallbackPrefixLength() const {
-    return fallback_prefix_length_;
-}
-
-void GenerateStream::setFallbackPrefixLength(int fallback_prefix_length) {
-    fallback_prefix_length_ = fallback_prefix_length;
-}
-
 void GenerateStream::incLastOutputPos() {
     last_output_pos_++;
 }
 
 bool GenerateStream::isContextStream() const {
     return *is_context_stream_;
-}
-
-bool GenerateStream::isChunkStream() const {
-    return enable_fast_gen_ && current_chunk_len_ < max_chunk_len_;
 }
 
 const rtp_llm::BufferPtr& GenerateStream::cumLogProbs() const {
@@ -542,9 +483,6 @@ vector<int> GenerateStream::currentExecuteTokens(int batch_idx) const {
 void GenerateStream::step() {
     // iter_count represents the times of the stream participates in running
     iter_count_++;
-    if (isContextStream()) {
-        setFallbackPrefixLength(0);
-    }
 }
 
 void GenerateStream::spStep() {
@@ -758,7 +696,7 @@ void GenerateStream::matchEosToken() {
 
 void GenerateStream::matchEosToken(int batch_id) {
     if ((!generate_input_->generate_config->ignore_eos)
-        && complete_token_ids_->matchEosToken(batch_id, special_tokens_.eos_token_id_)) {
+        && complete_token_ids_->matchEosToken(batch_id, special_tokens_.eos_token_id)) {
         sub_generate_status_[batch_id].status = StreamState::FINISHED;
     }
 }
@@ -801,7 +739,7 @@ void GenerateStream::matchStopWordsList(int batch_id) {
     bool match = false;
     for (auto& stop_words : generate_input_->generate_config->stop_words_list) {
         if (generate_input_->generate_config->ignore_eos && stop_words.size() == 1
-            && stop_words[0] == special_tokens_.eos_token_id_) {
+            && stop_words[0] == special_tokens_.eos_token_id) {
             continue;
         }
         if (complete_token_ids_->matchStopWordsList(batch_id, stop_words)) {
@@ -956,8 +894,6 @@ void GenerateStream::reportMetric() {
                 "stream [%ld] report first latency us = %ld", streamId(), collector.first_token_latency_us);
             collector.wait_latency_us          = wait_time_us_;
             collector.pause_latency_us         = pause_time_us_;
-            collector.fallback_tokens          = fallback_blocks_ * seqSizePerBlock();
-            collector.fallback_times           = fallback_times_;
             collector.batch_with_prefill_times = batch_with_prefill_times_;
             collector.batch_with_prefill_len   = batch_with_prefill_len_;
             collector.malloc_failed_times      = stream_cache_resource_->mallocFailedTimes();
@@ -977,11 +913,8 @@ std::string GenerateStream::debugString() const {
     debug_string << "GenerateStream {"
                  << "generate_input:" << generate_input_->debugString() << ", max_seq_len:" << max_seq_len_
                  << ", input_length:" << inputLength() << ", seq_length:" << seqLength()
-                 << ", reuse_length:" << reuse_length_ << ", current_chunk_len:" << current_chunk_len_
-                 << ", last_chunk_len_:" << last_chunk_len_ << ", max_chunk_len_:" << max_chunk_len_
-                 << ", current_batch_size:" << currentBatchSize() << ", next_batch_size:" << nextBatchSize()
-                 << ", need_release_resource: " << need_release_resource_
-                 << ", fallback_prefix_length: " << fallback_prefix_length_
+                 << ", reuse_length:" << reuse_length_ << ", current_batch_size:" << currentBatchSize()
+                 << ", next_batch_size:" << nextBatchSize() << ", need_release_resource: " << need_release_resource_
                  << ", sp_edit_search_index: " << sp_edit_search_index_ << ", mtp token indices" << mtp_token_index_
                  << ", need_remote_generate: " << need_remote_generate_
                  << ", contain_propose_token: " << contain_propose_token_ << ", propose_token: " << propose_token_;

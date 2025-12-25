@@ -27,11 +27,12 @@ def _curl_server_single_worker(
     req = {
         "prompt": input_query,
         "top_k": 1,
-        "max_new_tokens": decode_test_length if is_decode else 10,
-        "min_new_tokens": decode_test_length if is_decode else 10,
+        "max_new_tokens": decode_test_length if is_decode else 1,
+        "min_new_tokens": decode_test_length if is_decode else 1,
     }
     if profile:
         req["gen_timeline"] = True
+        req["profile_step"] = 1
     try:
         response = requests.post(
             f"http://127.0.0.1:{base_port}", json=req, timeout=wait_time

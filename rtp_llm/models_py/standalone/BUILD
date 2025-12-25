@@ -1,12 +1,12 @@
 load("//bazel:arch_select.bzl", get_triton_deps = "triton_deps")
 
 py_library(
-    name = "rtp_auto_model",
-    srcs = ["rtp_auto_model.py"],
+    name = "auto_model",
+    srcs = ["auto_model.py"],
     deps = [
         ":py_standalone_testlib",
 
-        # rtp_auto_model extra deps
+        # auto_model extra deps
         "//rtp_llm:async_model",           # async_decoder_engine
         "//rtp_llm:embedding",             # embedding
         "//rtp_llm:models",                # rtp_llm.models
@@ -38,13 +38,19 @@ py_library(
         "//rtp_llm:torch",
         "//rtp_llm:transformers",
         "//rtp_llm/test/utils:bench_util",
+        "//rtp_llm/test/utils:numeric_util",
         "//rtp_llm/test/utils:port_util",
         "//rtp_llm/test/utils:device_resource",
         "//rtp_llm/test/utils:stream_util",
     ] + select({
         "@//:using_rocm": [
             "//rtp_llm:aiter",
+            "//rtp_llm:pytorch-triton-rocm",
             "//rtp_llm:amdsmi",
+        ],
+        "@//:using_cuda12": [
+            "//rtp_llm:deep_gemm",
+            "//rtp_llm:flashinfer-python",
         ],
         "//conditions:default": [],
     }),

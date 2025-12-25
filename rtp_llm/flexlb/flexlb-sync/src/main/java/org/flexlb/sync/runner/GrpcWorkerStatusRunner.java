@@ -8,6 +8,7 @@ import org.flexlb.enums.BalanceStatusEnum;
 import org.flexlb.service.grpc.EngineGrpcService;
 import org.flexlb.service.grpc.EngineStatusConverter;
 import org.flexlb.service.monitor.EngineHealthReporter;
+import org.flexlb.util.CommonUtils;
 import org.flexlb.util.IdUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,7 +19,6 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.flexlb.constant.CommonConstants.DEADLINE_EXCEEDED_MESSAGE;
-import static org.flexlb.util.CommonUtils.toGrpcPort;
 
 public class GrpcWorkerStatusRunner implements Runnable {
 
@@ -47,7 +47,7 @@ public class GrpcWorkerStatusRunner implements Runnable {
         String[] split = ipPort.split(":");
         this.ip = split[0];
         this.port = Integer.parseInt(split[1]);
-        this.grpcPort = toGrpcPort(Integer.parseInt(split[1]));
+        this.grpcPort = CommonUtils.toGrpcPort(Integer.parseInt(split[1]));
         this.modelName = modelName;
         this.workerStatuses = workerStatuses;
         this.site = site;
@@ -145,6 +145,9 @@ public class GrpcWorkerStatusRunner implements Runnable {
 
             // 更新本地任务状态（包含检查丢失、更新运行、清理完成）
             workerStatus.updateTaskStates(runningTaskInfo, finishedTaskList);
+
+            // 纠偏运行队列总排队时间
+            workerStatus.updateRunningQueueTime();
 
             engineHealthReporter.reportStatusCheckerSuccess(modelName, workerStatus,
                     Optional.ofNullable(runningTaskInfo).map(List::size).orElse(0),
