@@ -1150,12 +1150,9 @@ AttentionModuleOutput ROCmDevice::decoderSelfAttention(const AttentionModulePara
                             true);
         auto offset_kv_block_array = OffsetIndexedKVBlockArray(
             kv_block_array,
-            (rtp_llm::KVBlockArrayForContextFMHA::DataType*)
-                params.common.kv_cache->kv_cache_block_id->data(),
-            params.common.kv_cache->k_cache_buffer->shape()[0] *
-                params.common.kv_cache->layer_num);
+            (rtp_llm::KVBlockArrayForContextFMHA::DataType*)params.common.kv_cache->kv_cache_block_id->data());
         prefix_prompt_param.offset_kv_block_array = offset_kv_block_array;
-        
+
         auto   token_num          = params.input.shape()[0];
         auto   decoder_batch_size = params.common.decoder_batch_size;
         auto   head_num           = params.configs.head_num;
