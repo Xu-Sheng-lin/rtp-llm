@@ -1,0 +1,12 @@
+#pragma once
+
+#include <hip/hip_runtime.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+
+hipError_t _pa_decode_reduce_kernel_512_2(hipStream_t stream, hipDeviceptr_t out_ptr, hipDeviceptr_t exp_sums_ptr, hipDeviceptr_t max_logits_ptr, hipDeviceptr_t logits_ptrs, hipDeviceptr_t seq_lens_ptr, int32_t stride_o_s, int32_t stride_o_h, int32_t stride_exp_sums_s, int32_t stride_exp_sums_h, int32_t stride_exp_sums_p, int32_t stride_logits_s, int32_t stride_logits_h, int32_t stride_logits_p, int32_t stride_logits_g, int32_t gX, int32_t gY, int32_t gZ);
+hipError_t _pa_decode_reduce_kernel_512_4(hipStream_t stream, hipDeviceptr_t out_ptr, hipDeviceptr_t exp_sums_ptr, hipDeviceptr_t max_logits_ptr, hipDeviceptr_t logits_ptrs, hipDeviceptr_t seq_lens_ptr, int32_t stride_o_s, int32_t stride_o_h, int32_t stride_exp_sums_s, int32_t stride_exp_sums_h, int32_t stride_exp_sums_p, int32_t stride_logits_s, int32_t stride_logits_h, int32_t stride_logits_p, int32_t stride_logits_g, int32_t gX, int32_t gY, int32_t gZ);
+hipError_t _pa_decode_reduce_kernel_512_8(hipStream_t stream, hipDeviceptr_t out_ptr, hipDeviceptr_t exp_sums_ptr, hipDeviceptr_t max_logits_ptr, hipDeviceptr_t logits_ptrs, hipDeviceptr_t seq_lens_ptr, int32_t stride_o_s, int32_t stride_o_h, int32_t stride_exp_sums_s, int32_t stride_exp_sums_h, int32_t stride_exp_sums_p, int32_t stride_logits_s, int32_t stride_logits_h, int32_t stride_logits_p, int32_t stride_logits_g, int32_t gX, int32_t gY, int32_t gZ);
+hipError_t _pa_decode_reduce_kernel_512_16(hipStream_t stream, hipDeviceptr_t out_ptr, hipDeviceptr_t exp_sums_ptr, hipDeviceptr_t max_logits_ptr, hipDeviceptr_t logits_ptrs, hipDeviceptr_t seq_lens_ptr, int32_t stride_o_s, int32_t stride_o_h, int32_t stride_exp_sums_s, int32_t stride_exp_sums_h, int32_t stride_exp_sums_p, int32_t stride_logits_s, int32_t stride_logits_h, int32_t stride_logits_p, int32_t stride_logits_g, int32_t gX, int32_t gY, int32_t gZ);
+hipError_t _pa_decode_reduce_kernel_512_32(hipStream_t stream, hipDeviceptr_t out_ptr, hipDeviceptr_t exp_sums_ptr, hipDeviceptr_t max_logits_ptr, hipDeviceptr_t logits_ptrs, hipDeviceptr_t seq_lens_ptr, int32_t stride_o_s, int32_t stride_o_h, int32_t stride_exp_sums_s, int32_t stride_exp_sums_h, int32_t stride_exp_sums_p, int32_t stride_logits_s, int32_t stride_logits_h, int32_t stride_logits_p, int32_t stride_logits_g, int32_t gX, int32_t gY, int32_t gZ);
