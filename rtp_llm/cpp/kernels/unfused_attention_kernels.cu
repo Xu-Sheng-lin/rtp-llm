@@ -4275,12 +4275,12 @@ __global__ void add_fusedQKV_bias_transpose_decode_kernel_v1(T*                 
             } else {
 #pragma unroll
                 for (int vec_i = 0; vec_i < vec_size; vec_i++) {
-                    const int inKBlockIdx = kv_block_array.getKLocalIdx<KvCacheDataType::BASE>(
+                    const int inKBlockIdx = offset_kv_block_array.getKLocalIdx<KvCacheDataType::BASE>(
                         dst_kv_seq_idx, head_idx, size_per_head, tidx * vec_size + vec_i);
                     k_cache[inKBlockIdx] = reinterpret_cast<T*>(&k)[vec_i];
 
                     const int inVBlockIdx =
-                        kv_block_array.getVLocalIdx(dst_kv_seq_idx, head_idx, size_per_head, tidx * vec_size + vec_i);
+                        offset_kv_block_array.getVLocalIdx(dst_kv_seq_idx, head_idx, size_per_head, tidx * vec_size + vec_i);
                     v_cache[inVBlockIdx] = reinterpret_cast<T*>(&v)[vec_i];
                 }
             }
