@@ -1123,8 +1123,14 @@ AttentionModuleOutput ROCmDevice::decoderSelfAttention(const AttentionModulePara
 
     if (init_params_.use_aiter_pa) {
         PrefixPromptBatchWeightsParam prefix_prompt_param;
-        KVBlockArray kv_block_array = getKVBlockArray(params, *kv_cache_offset, batch_size, params.common.kv_cache->k_cache_buffer->type() == DataType::TYPE_FP8_E4M3, false);
-        prefix_prompt_param.kv_block_array = kv_block_array;
+        KVBlockArray kv_block_array = getKVBlockArray(params, *kv_cache_offset, batch_size, params.common.kv_cache->k_cache_buffer->type() == DataType::TYPE_FP8_E4M3, true);
+        auto offset_kv_block_array = OffsetIndexedKVBlockArray(
+            kv_block_array,
+            (rtp_llm::KVBlockArrayForContextFMHA::DataType*)
+                params.common.kv_cache->kv_cache_block_id->data(),
+            params.common.kv_cache->k_cache_buffer->shape()[0] *
+                params.common.kv_cache->layer_num);
+        prefix_prompt_param.offset_kv_block_array = offset_kv_block_array;
 
         auto   token_num          = params.input.shape()[0];
         auto   decoder_batch_size = params.common.decoder_batch_size;
