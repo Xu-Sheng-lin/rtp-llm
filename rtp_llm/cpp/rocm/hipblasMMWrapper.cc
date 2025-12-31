@@ -380,6 +380,25 @@ void hipblasMMWrapper::Gemm(hipblasOperation_t transa,
                                      ldc,
                                      getHipBlasDataType(computeType_),
                                      HIPBLAS_GEMM_DEFAULT));
+        } else {
+            hipblasLtMatmulInfo cache_info;
+            cache_info.opDesc.reset(matmul);
+            cache_info.ADesc.reset(ADesc);
+            cache_info.BDesc.reset(BDesc);
+            cache_info.CDesc.reset(CDesc);
+            cache_info.algo = heuristicResult[0].algo;
+            
+            // 取消 ScopeGuard 的自动销毁，因为所有权已转移
+            matmul = nullptr;
+            ADesc = nullptr;
+            BDesc = nullptr;
+            CDesc = nullptr;
+            
+            // 缓存
+            hipblas_algo_map_.setAlgo(transa, transb, m, n, k, Atype_, lda, 0,
+                                      Btype_, ldb, 0, Ctype_, ldc, 0,
+                                      HIPBLAS_COMPUTE_32F, 1, HIPBLASLT_EPILOGUE_DEFAULT,
+                                      std::move(cache_info));
         }
     }
 }
@@ -578,3 +597,4 @@ void hipblasMMWrapper::GemmBiasAct(hipblasOperation_t        transa,
 
 }  // namespace rocm
 }  // namespace rtp_llm
+

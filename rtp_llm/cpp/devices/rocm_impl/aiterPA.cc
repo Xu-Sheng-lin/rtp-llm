@@ -134,7 +134,7 @@ void runAiterPA(const AttentionModuleParams& params, rtp_llm::DeviceBase* device
     }
 
     auto context_lens = aiter_attn->sequence_lengths_t;
-    if (max_seq_len <= 4096) {
+    if (max_seq_len <= 16384) {
         int64_t x = 16 / key_cache.element_size();
         auto kv_sizes = value_cache.sizes();
         out = out.view({int64_t(num_seqs), int64_t(num_heads), int64_t(head_size)});
