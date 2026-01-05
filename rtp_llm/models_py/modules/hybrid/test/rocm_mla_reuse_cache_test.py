@@ -10,7 +10,8 @@ import torch.nn.functional as F
 # sys.path.append(os.path.join(str(CUR_PATH), "../../../"))
 device = torch.device(f"cuda")
 
-from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.ops import ParallelismConfig
 from rtp_llm.models.rotary_embedding.deepseek_rotary_embedding import (
     DeepseekV3YarnRotaryEmbedding,
 )
@@ -99,19 +100,23 @@ class MLATest(TestCase):
             device=torch.device("cpu"),
         )
 
-        self.config = GptInitModelParameters(128, 16, 27, 1024, 102400)
-        self.config.head_num = 16
+        self.config = ModelConfig()
+        self.config.attn_config.head_num = 16
         self.config.hidden_size = hidden_size
-        self.config.nope_head_dim = 128
-        self.config.rope_head_dim = 64
-        self.config.kv_lora_rank = 512
-        self.config.v_head_dim = 128
-        self.config.q_lora_rank = 0
-        self.config.seq_size_per_block = 64
-        self.config.softmax_extra_scale = 1.0
-        self.config.use_mla = True
-        self.config.size_per_head = 192
-        self.scaling = (self.config.nope_head_dim + self.config.rope_head_dim) ** (-0.5)
+        self.config.attn_config.nope_head_dim = 128
+        self.config.attn_config.rope_head_dim = 64
+        self.config.attn_config.kv_lora_rank = 512
+        self.config.attn_config.v_head_dim = 128
+        self.config.attn_config.q_lora_rank = 0
+        self.config.attn_config.tokens_per_block = 64
+        self.config.attn_config.softmax_extra_scale = 1.0
+        self.config.attn_config.use_mla = True
+        self.config.attn_config.size_per_head = 192
+        self.scaling = (self.config.attn_config.nope_head_dim + self.config.attn_config.rope_head_dim) ** (-0.5)
+
+        self.parallelism_config = ParallelismConfig()
+        self.parallelism_config.tp_size = 1
+        self.parallelism_config.tp_rank = 0
 
         torch.manual_seed(0)
         input_lengths_t = torch.tensor(
@@ -136,28 +141,29 @@ class MLATest(TestCase):
         layer_weights: List[Dict[str, torch.Tensor]] = [weights]
 
         cos_sin_cache = create_cos_sin_cache()
+
         fmha_impl = AiterMlaPrefillImpl(
-            self.config, attn_inputs, layer_weights, cos_sin_cache
+            self.config.attn_config, attn_inputs, layer_weights, cos_sin_cache, quant_config=self.config.quant_config
         )
 
         q = torch.randn(
             [
                 num_tokens,
-                self.config.head_num,
-                self.config.nope_head_dim + self.config.rope_head_dim,
+                self.config.attn_config.head_num,
+                self.config.attn_config.nope_head_dim + self.config.attn_config.rope_head_dim,
             ],
             dtype=torch.bfloat16,
             device=device,
         )
 
         compressed_kv = torch.randn(
-            [num_tokens, self.config.kv_lora_rank],
+            [num_tokens, self.config.attn_config.kv_lora_rank],
             dtype=torch.bfloat16,
             device=device,
         )
 
         k_pe = torch.randn(
-            [num_tokens, self.config.rope_head_dim],
+            [num_tokens, self.config.attn_config.rope_head_dim],
             dtype=torch.bfloat16,
             device=device,
         )
@@ -166,7 +172,7 @@ class MLATest(TestCase):
             [
                 mock_page_num,
                 page_size,
-                self.config.kv_lora_rank + self.config.rope_head_dim,
+                self.config.attn_config.kv_lora_rank + self.config.attn_config.rope_head_dim,
             ],
             dtype=torch.bfloat16,
             device=device,
@@ -177,7 +183,7 @@ class MLATest(TestCase):
 
         k_cache, v_cache = torch.split(
             kv_cache.k_cache_base,
-            [self.config.kv_lora_rank, self.config.rope_head_dim],
+            [self.config.attn_config.kv_lora_rank, self.config.attn_config.rope_head_dim],
             dim=-1,
         )
 
@@ -195,40 +201,42 @@ class MLATest(TestCase):
 
         out = fmha_impl.compute_prefill_context(q, compressed_kv, k_pe, kv_cache, 0)
 
-        index_list = fmha_impl.fmha_params.reuse_cache_page_indice.clone()
+        index_list = torch.empty(0, dtype=torch.int32, device=device)
+        if fmha_impl.fmha_params.reuse_cache_page_indice is not None:
+            index_list = fmha_impl.fmha_params.reuse_cache_page_indice.clone()
         selected_blocks = cache[index_list]
         selected_blocks = selected_blocks.view(-1, selected_blocks.size(-1))
 
         compressed_kv = torch.cat(
             [selected_blocks[:, : compressed_kv.size(1)], compressed_kv], dim=0
         )
-        k_pe = k_pe.view(-1, self.config.rope_head_dim)
-        k_pe = torch.cat([selected_blocks[:, compressed_kv.size(1) :], k_pe], dim=0)
+        k_pe = k_pe.view(-1, self.config.attn_config.rope_head_dim)
+        k_pe = torch.cat([selected_blocks[:, compressed_kv.size(1):], k_pe], dim=0)
 
-        k_pe = k_pe.view(-1, 1, self.config.rope_head_dim)
+        k_pe = k_pe.view(-1, 1, self.config.attn_config.rope_head_dim)
         self.k_nope_proj = LinearFactory.create_linear_from_weights(
-            layer_weights[0], W.mla_k_nope_w, W.mla_k_nope_s, None, self.config
+            layer_weights[0], W.mla_k_nope_w, W.mla_k_nope_s, None
         )
 
         self.v_proj = LinearFactory.create_linear_from_weights(
-            layer_weights[0], W.mla_v_w, W.mla_v_s, None, self.config
+            layer_weights[0], W.mla_v_w, W.mla_v_s, None
         )
 
         k_nope = self.k_nope_proj(compressed_kv)
         value_states = self.v_proj(compressed_kv)
 
-        k_nope = k_nope.view(-1, self.config.head_num, self.config.nope_head_dim)
+        k_nope = k_nope.view(-1, self.config.attn_config.head_num, self.config.attn_config.nope_head_dim)
         value_states = value_states.view(
-            -1, self.config.head_num, self.config.v_head_dim
+            -1, self.config.attn_config.head_num, self.config.attn_config.v_head_dim
         )
 
         k = k_pe.new_empty(
             k_pe.size(0),
-            self.config.head_num,
-            self.config.rope_head_dim + self.config.nope_head_dim,
+            self.config.attn_config.head_num,
+            self.config.attn_config.rope_head_dim + self.config.attn_config.nope_head_dim,
         )
-        k[..., : self.config.nope_head_dim] = k_nope
-        k[..., self.config.nope_head_dim :] = k_pe
+        k[..., : self.config.attn_config.nope_head_dim] = k_nope
+        k[..., self.config.attn_config.nope_head_dim:] = k_pe
         out_ref, _ = attention_ref(
             1,
             q,
@@ -240,8 +248,6 @@ class MLATest(TestCase):
 
         print(out.shape)
         print(out_ref.shape)
-        # nan_indices = torch.nonzero(torch.isnan(out))
-        # print(nan_indices)
         print(out)
         print(out_ref)
 

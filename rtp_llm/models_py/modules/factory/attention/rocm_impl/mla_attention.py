@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
+from rtp_llm.ops import AttentionConfigs, FMHAConfig, FMHAType
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 from rtp_llm.models_py.modules.factory.attention.mla_utils import check_attention_inputs
 from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHADecodeImplBase, FMHAPrefillImplBase
@@ -149,17 +149,33 @@ def rocm_fill_mla_params(
 
 
 class AiterMlaPrefillOp:
-    def __init__(self, config: GptInitModelParameters,
-                 weights: List[Dict[str, torch.Tensor]]):
-        self.config = config
-        self.head_num = config.head_num // config.tp_size
-        self.head_num_kv = config.head_num_kv // config.tp_size
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.nope_head_dim
-        self.qk_rope_head_dim = config.rope_head_dim
-        self.page_size = config.seq_size_per_block
-        self.v_head_dim = config.v_head_dim
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        qk_nope_head_dim: int,
+        page_size: int,
+        softmax_extra_scale: float,
+        use_mla: bool,
+        weights: List[Dict[str, torch.Tensor]] | None,
+        quant_config: Optional[object] = None,
+    ):
+        super().__init__()
+        if weights is None:
+            raise Exception(f"MlaAbsorbAttention need weights but got none")
+        self.attn_configs = attn_configs
+        self.quant_config = quant_config
+        self.num_heads = num_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.scale = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
         self.weights = weights
+        self.token_per_block = page_size
+        self.softmax_extra_scale = softmax_extra_scale
+        self.use_mla = use_mla
 
     def support(self, attn_inputs: PyAttentionInputs) -> bool:
         return True
@@ -171,7 +187,7 @@ class AiterMlaPrefillOp:
             attn_inputs.sequence_lengths,
             attn_inputs.input_lengths,
             attn_inputs.kv_cache_block_id_host,
-            self.page_size,
+            self.token_per_block,
         )
 
     def forward(self,
@@ -182,21 +198,25 @@ class AiterMlaPrefillOp:
                 layer_id: int):
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         self.k_nope_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None, self.config
+            self.weights[layer_id],
+            W.mla_k_nope_w,
+            W.mla_k_nope_s,
+            None,
+            self.quant_config,
         )
 
         self.v_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None, self.config
+            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None, self.quant_config
         )
 
         k_nope = self.k_nope_proj(compressed_kv)
         value_states = self.v_proj(compressed_kv)
 
-        k_nope = k_nope.view(-1, self.head_num, self.qk_nope_head_dim)
-        value_states = value_states.view(-1, self.head_num, self.v_head_dim)
+        k_nope = k_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
+        value_states = value_states.view(-1, self.num_heads, self.qk_nope_head_dim)
 
         k = k_pe.new_empty(
-            k_pe.size(0), self.head_num, self.qk_rope_head_dim + self.qk_nope_head_dim
+            k_pe.size(0), self.num_heads, self.qk_rope_head_dim + self.qk_nope_head_dim
         )
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim:] = k_pe
@@ -228,16 +248,29 @@ class AiterMlaPrefillOp:
 
 
 class AiterMlaDecodeOp:
-    def __init__(self, config: GptInitModelParameters,
-                 weights: List[Dict[str, torch.Tensor]]):
-        self.head_num = config.head_num // config.tp_size
-        self.head_num_kv = config.head_num_kv // config.tp_size
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.nope_head_dim
-        self.qk_rope_head_dim = config.rope_head_dim
-        self.page_size = config.seq_size_per_block
-        self.v_head_dim = config.v_head_dim
+    def __init__(
+            self,
+            num_heads: int,
+            kv_lora_rank: int,
+            qk_rope_head_dim: int,
+            qk_nope_head_dim: int,
+            token_per_block: int,
+            softmax_extra_scale: float,
+            use_mla: bool,
+            weights: List[Dict[str, torch.Tensor]] | None = None,
+    ):
+        super().__init__()
+        if weights is None:
+            raise Exception(f"MlaAbsorbAttention need weights but got none")
+        self.num_heads = num_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.scale = (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+        self.token_per_block = token_per_block
+        self.softmax_extra_scale = softmax_extra_scale
         self.weights = weights
+        self.use_mla = use_mla
 
     def support(self, attn_inputs: PyAttentionInputs) -> bool:
         return True
@@ -249,7 +282,7 @@ class AiterMlaDecodeOp:
             attn_inputs.sequence_lengths,
             attn_inputs.input_lengths,
             attn_inputs.kv_cache_block_id_host,
-            self.page_size,
+            self.token_per_block,
         )
 
     def forward(self, q: torch.Tensor,
@@ -275,7 +308,7 @@ class AiterMlaDecodeOp:
 
         ckv_cache_shape = kv_cache.k_cache_base.shape
         kv_buffer = kv_cache.k_cache_base.view(ckv_cache_shape[0], ckv_cache_shape[1], 1, ckv_cache_shape[2])
-        out_asm = torch.empty((total_q, self.head_num, self.kv_lora_rank), dtype=torch.bfloat16).fill_(-1)
+        out_asm = torch.empty((total_q, self.num_heads, self.kv_lora_rank), dtype=torch.bfloat16).fill_(-1)
 
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         sm_scale = 1.0 / (qk_head_dim ** 0.5)
@@ -305,7 +338,7 @@ class AiterMlaDecodeOp:
                 sm_scale=sm_scale
             )
 
-        attn_output = attn_logits.view(-1, self.head_num, self.kv_lora_rank)
+        attn_output = attn_logits.view(-1, self.num_heads, self.kv_lora_rank)
         attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), v_weight)
         attn_bmm_output = attn_bmm_output.transpose(0, 1)
         return attn_bmm_output
@@ -384,24 +417,33 @@ try:
     class AiterMlaPrefillImpl(FMHAPrefillImplBase):
         def __init__(
             self,
-            config: GptInitModelParameters,
+            attn_configs: AttentionConfigs,
             attn_inputs: PyAttentionInputs,
             weights: List[Dict[str, torch.Tensor]],
             cos_sin_cache: torch.Tensor,
-            absorb_opt_len: int = 1024
+            fmha_config: Optional[FMHAConfig] = None,
+            quant_config: Optional[object] = None,
         ) -> None:
             # trt prefill not support reuse cache yet
             super().__init__(
                 AiterMlaPrefillOp(
-                    config=config,
-                    weights=weights
+                    attn_configs,
+                    attn_configs.head_num,
+                    attn_configs.kv_lora_rank,
+                    attn_configs.rope_head_dim,
+                    attn_configs.nope_head_dim,
+                    attn_configs.tokens_per_block,
+                    attn_configs.softmax_extra_scale,
+                    attn_configs.use_mla,
+                    weights,
+                    quant_config,
                 ),
                 AiterMlaRotaryEmbeddingOp(
-                    head_size=config.nope_head_dim,
+                    head_size=attn_configs.nope_head_dim,
                     cos_sin_cache=cos_sin_cache,
-                    kv_lora_rank=config.kv_lora_rank,
-                    rope_head_dim=config.rope_head_dim,
-                    token_per_block=config.seq_size_per_block,
+                    kv_lora_rank=attn_configs.kv_lora_rank,
+                    rope_head_dim=attn_configs.rope_head_dim,
+                    token_per_block=attn_configs.tokens_per_block,
                     is_neox_style=False,
                 ),
                 attn_inputs,
@@ -412,12 +454,24 @@ try:
             if attn_inputs.prefix_lengths is not None:
                 self.has_reuse_cache = attn_inputs.prefix_lengths.max().item() > 0
 
-            self.absorb_opt_len = absorb_opt_len
+            self.absorb_opt_len = (
+                fmha_config.absorb_opt_len if fmha_config is not None else 1024
+            )
             self.aborb_fmha = AiterMlaDecodeOp(
-                config=config,
-                weights=weights,
+                attn_configs.head_num,
+                attn_configs.kv_lora_rank,
+                attn_configs.rope_head_dim,
+                attn_configs.nope_head_dim,
+                attn_configs.tokens_per_block,
+                attn_configs.softmax_extra_scale,
+                attn_configs.use_mla,
+                weights,
             )
             self.aborb_fmha.prepare(attn_inputs)
+
+        @staticmethod
+        def fmha_type() -> FMHAType:
+            return FMHAType.AITER_PREFILL
 
         def compute_prefill_context(
             self,
@@ -496,26 +550,38 @@ try:
 
         def __init__(
             self,
-            config: GptInitModelParameters,
+            attn_configs: AttentionConfigs,
             attn_inputs: PyAttentionInputs,
             weights: List[Dict[str, torch.Tensor]],
             cos_sin_cache: torch.Tensor,
+            fmha_config: Optional[FMHAConfig] = None,
+            quant_config: Optional[object] = None,
         ) -> None:
             super().__init__(
                 AiterMlaDecodeOp(
-                    config=config,
-                    weights=weights
+                    attn_configs.head_num,
+                    attn_configs.kv_lora_rank,
+                    attn_configs.rope_head_dim,
+                    attn_configs.nope_head_dim,
+                    attn_configs.tokens_per_block,
+                    attn_configs.softmax_extra_scale,
+                    attn_configs.use_mla,
+                    weights,
                 ),
                 AiterMlaRotaryEmbeddingOp(
-                    head_size=config.nope_head_dim,
+                    head_size=attn_configs.nope_head_dim,
                     cos_sin_cache=cos_sin_cache,
-                    kv_lora_rank=config.kv_lora_rank,
-                    rope_head_dim=config.rope_head_dim,
-                    token_per_block=config.seq_size_per_block,
+                    kv_lora_rank=attn_configs.kv_lora_rank,
+                    rope_head_dim=attn_configs.rope_head_dim,
+                    token_per_block=attn_configs.tokens_per_block,
                     is_neox_style=False,
                 ),
                 attn_inputs,
             )
+
+        @staticmethod
+        def fmha_type() -> FMHAType:
+            return FMHAType.AITER_DECODE
 
         def forward(
             self,
