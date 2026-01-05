@@ -93,7 +93,6 @@ class MLATest(TestCase):
         mock_page_num = 2048
         page_num = (reuse_len + num_tokens + page_size - 1) // page_size
         block_list = [i for i in range(1, page_num + 1)]
-        # print(f"block_list: {block_list}")
         kvcache_block_id = torch.tensor(
             [block_list],
             dtype=torch.int32,
@@ -275,57 +274,57 @@ class MLATest(TestCase):
         weights[W.mla_fusedqkrope_no_lora_w] = torch.randn(
             [
                 config.hidden_size,
-                config.size_per_head * config.head_num
-                + config.kv_lora_rank
-                + config.rope_head_dim,
+                config.attn_config.size_per_head * config.attn_config.head_num
+                + config.attn_config.kv_lora_rank
+                + config.attn_config.rope_head_dim,
             ],
             dtype=torch.bfloat16,
             device=device,
         )
 
         weights[W.mla_kv_a_ln_gamma] = torch.randn(
-            [config.kv_lora_rank], dtype=torch.bfloat16, device=device
+            [config.attn_config.kv_lora_rank], dtype=torch.bfloat16, device=device
         )
 
         weights[W.mla_kc] = torch.randn(
-            [config.head_num, config.nope_head_dim, config.kv_lora_rank],
+            [config.attn_config.head_num, config.attn_config.nope_head_dim, config.attn_config.kv_lora_rank],
             dtype=torch.bfloat16,
             device=device,
         )
 
         weights[W.mla_vc] = torch.randn(
-            [config.head_num, config.kv_lora_rank, config.v_head_dim],
+            [config.attn_config.head_num, config.attn_config.kv_lora_rank, config.attn_config.v_head_dim],
             dtype=torch.bfloat16,
             device=device,
         )
 
         weights[W.mla_v_w] = torch.randn(
-            [config.kv_lora_rank, hidden_size],
+            [config.attn_config.kv_lora_rank, hidden_size],
             dtype=torch.bfloat16,
             device=device,
         )
 
         weights[W.mla_k_nope_w] = torch.randn(
-            [config.kv_lora_rank, hidden_size],
+            [config.attn_config.kv_lora_rank, hidden_size],
             dtype=torch.bfloat16,
             device=device,
         )
 
         weights[W.mla_kc] = (
             weights[W.mla_k_nope_w]
-            .view(config.kv_lora_rank, config.head_num, config.nope_head_dim)
+            .view(config.attn_config.kv_lora_rank, config.attn_config.head_num, config.attn_config.nope_head_dim)
             .transpose(0, 1)
             .transpose(1, 2)
         )
         weights[W.mla_vc] = (
             weights[W.mla_v_w]
-            .view(config.kv_lora_rank, config.head_num, config.v_head_dim)
+            .view(config.attn_config.kv_lora_rank, config.attn_config.head_num, config.attn_config.v_head_dim)
             .transpose(0, 1)
         )
 
         weights[W.attn_o_w] = torch.randn(
             [
-                config.head_num * config.v_head_dim,
+                config.attn_config.head_num * config.attn_config.v_head_dim,
                 config.hidden_size,
             ],
             dtype=torch.bfloat16,

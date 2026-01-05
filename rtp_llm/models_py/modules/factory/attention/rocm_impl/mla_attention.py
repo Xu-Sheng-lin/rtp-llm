@@ -72,9 +72,6 @@ def rocm_fill_mla_params(
     max_kv_len = 0
     batch_start_idx = 0
 
-    print(input_lengths)
-    print(prefix_lengths)
-
     for i in range(batch_size):
         if prefix_lengths is not None:  # prefill
             input_length = input_lengths[i]
@@ -107,8 +104,6 @@ def rocm_fill_mla_params(
             seq_len = sequence_lengths[i] + 1
             accu_q_len += 1
             accu_kv_len += 1
-
-        print("accu_kv_len:", accu_kv_len)
 
         last_page_len = (seq_len - 1) % seq_size_per_block + 1
         paged_kv_last_page_len.append(last_page_len)
