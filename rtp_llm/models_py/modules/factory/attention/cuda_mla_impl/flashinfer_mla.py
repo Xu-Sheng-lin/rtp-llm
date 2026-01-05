@@ -10,7 +10,6 @@ from flashinfer import (
     BatchMLAPagedAttentionWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
 )
-
 from flashinfer.jit import gen_batch_mla_module, gen_batch_prefill_module
 from flashinfer.utils import is_sm90a_supported
 
@@ -19,13 +18,19 @@ from rtp_llm.models_py.modules.factory.linear.factory import LinearFactory
 from rtp_llm.models_py.modules.factory.attention.mla_utils import check_attention_inputs
 
 # from rtp_llm.config.gpt_init_model_parameters import GptInitModelParameters
-from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs, rtp_llm_ops
 from rtp_llm.ops import AttentionConfigs
+from rtp_llm.ops.compute_ops import KVCache, PyAttentionInputs, rtp_llm_ops
 from rtp_llm.utils.model_weight import W
 
 g_workspace_buffer = None
+warm_up_done = False
+
 
 def warmup_flashinfer_python():
+    global warm_up_done
+    if warm_up_done:
+        return
+    warm_up_done = True
     modules = []
     for backend in ["fa2", "fa3"]:
         if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
@@ -61,6 +66,83 @@ def warmup_flashinfer_python():
                 False,
             )
         )
+
+# adapted from sglang/python/sglang/srt/layers/attention/utils.py
+@triton.jit
+def concat_and_cast_mha_k_kernel(
+    k_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    head_cnt: tl.constexpr,
+    k_stride0: tl.constexpr,
+    k_stride1: tl.constexpr,
+    nope_stride0: tl.constexpr,
+    nope_stride1: tl.constexpr,
+    rope_stride0: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    head_range = tl.arange(0, head_cnt)
+
+    k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
+
+    nope_offs = tl.arange(0, nope_dim)
+
+    src_nope_ptr = (
+        k_nope_ptr
+        + pid_loc * nope_stride0
+        + head_range[:, None] * nope_stride1
+        + nope_offs[None, :]
+    )
+    dst_nope_ptr = k_head_ptr + nope_offs[None, :]
+
+    src_nope = tl.load(src_nope_ptr)
+    tl.store(dst_nope_ptr, src_nope)
+
+    rope_offs = tl.arange(0, rope_dim)
+    src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
+    dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
+    src_rope = tl.load(src_rope_ptr)
+    tl.store(dst_rope_ptr, src_rope)
+
+
+def concat_and_cast_mha_k_triton(
+    k: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+):
+    # The source data type will be implicitly converted to the target data type.
+    assert (
+        len(k.shape) == 3 and len(k_nope.shape) == 3 and len(k_rope.shape) == 3
+    ), f"shape should be 3d, but got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    assert (
+        k.shape[0] == k_nope.shape[0] and k.shape[0] == k_rope.shape[0]
+    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    assert (
+        k.shape[1] == k_nope.shape[1] and 1 == k_rope.shape[1]
+    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+    assert (
+        k.shape[-1] == k_nope.shape[-1] + k_rope.shape[-1]
+    ), f"invalid shape, got {k.shape=}, {k_nope.shape=}, {k_rope.shape=}"
+
+    nope_dim = k_nope.shape[-1]
+    rope_dim = k_rope.shape[-1]
+    grid = (k.shape[0],)
+
+    concat_and_cast_mha_k_kernel[grid](
+        k,
+        k_nope,
+        k_rope,
+        k.shape[1],
+        k.stride(0),
+        k.stride(1),
+        k_nope.stride(0),
+        k_nope.stride(1),
+        k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+    )
 
 
 class MlaFlashInferPrefillOp(object):
@@ -243,13 +325,15 @@ class MlaFlashInferPrefillOp(object):
 
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         self.k_nope_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None,
-            self.quant_config
+            self.weights[layer_id],
+            W.mla_k_nope_w,
+            W.mla_k_nope_s,
+            None,
+            self.quant_config,
         )
 
         self.v_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None,
-            self.quant_config
+            self.weights[layer_id], W.mla_v_w, W.mla_v_s, None, self.quant_config
         )
 
         k_nope = self.k_nope_proj(compressed_kv)
@@ -433,10 +517,10 @@ class TrtV2PrefillAttentionOp(object):
         self.attn_configs = attn_configs
         self.quant_config = quant_config
         self.weights = weights
-        self.use_mla = use_mla   
+        self.use_mla = use_mla
         # Get FMHAConfig - will check in support() method
         self.fmha_config = fmha_config
-        
+
         from rtp_llm.ops.compute_ops import TRTAttnOp
 
         self.fmha_impl = TRTAttnOp(attn_configs)
@@ -464,7 +548,7 @@ class TrtV2PrefillAttentionOp(object):
     ) -> torch.Tensor:
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
         self.k_nope_proj = LinearFactory.create_linear_from_weights(
-            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None, 
+            self.weights[layer_id], W.mla_k_nope_w, W.mla_k_nope_s, None,
             self.quant_config
         )
 

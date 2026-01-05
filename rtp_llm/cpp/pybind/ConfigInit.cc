@@ -52,7 +52,9 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .value("AITER_PREFILL", FMHAType::AITER_PREFILL)
         .value("AITER_ASM_PREFILL", FMHAType::AITER_ASM_PREFILL)
         .value("AITER_DECODE", FMHAType::AITER_DECODE)
-        .value("AITER_ASM_DECODE", FMHAType::AITER_ASM_DECODE);
+        .value("AITER_ASM_DECODE", FMHAType::AITER_ASM_DECODE)
+        .value("PY_FLASHINFER_PREFILL", FMHAType::PY_FLASHINFER_PREFILL)
+        .value("PY_FLASHINFER_DECODE", FMHAType::PY_FLASHINFER_DECODE);
 
     py::enum_<MlaOpsType>(m, "MlaOpsType")
         .value("AUTO", MlaOpsType::AUTO)
@@ -409,6 +411,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("prefill_capture_seq_lens", &HWKernelConfig::prefill_capture_seq_lens)
         .def_readwrite("decode_capture_batch_sizes", &HWKernelConfig::decode_capture_batch_sizes)
         .def_readwrite("disable_dpc_random", &HWKernelConfig::disable_dpc_random)
+        .def_readwrite("rocm_disable_custom_ag", &HWKernelConfig::rocm_disable_custom_ag)
         .def("to_string", &HWKernelConfig::to_string)
         .def(py::pickle(
             [](const HWKernelConfig& self) {
@@ -425,10 +428,11 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.num_native_cuda_graph,
                                       self.prefill_capture_seq_lens,
                                       self.decode_capture_batch_sizes,
-                                      self.disable_dpc_random);
+                                      self.disable_dpc_random,
+                                      self.rocm_disable_custom_ag);
             },
             [](py::tuple t) {
-                if (t.size() != 14)
+                if (t.size() != 15)
                     throw std::runtime_error("Invalid state!");
                 HWKernelConfig c;
                 try {
@@ -446,6 +450,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.prefill_capture_seq_lens     = t[11].cast<std::vector<int>>();
                     c.decode_capture_batch_sizes   = t[12].cast<std::vector<int>>();
                     c.disable_dpc_random           = t[13].cast<bool>();
+                    c.rocm_disable_custom_ag       = t[14].cast<bool>();
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("HWKernelConfig unpickle error: ") + e.what());
                 }
@@ -585,6 +590,35 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                 return c;
             }));
 
+    // LinearAttentionConfig
+    pybind11::class_<LinearAttentionConfig>(m, "LinearAttentionConfig")
+        .def(pybind11::init<int, int, int, int, int>(),
+             pybind11::arg("linear_conv_kernel_dim") = 0,
+             pybind11::arg("linear_key_head_dim")    = 0,
+             pybind11::arg("linear_num_key_heads")   = 0,
+             pybind11::arg("linear_num_value_heads") = 0,
+             pybind11::arg("linear_value_head_dim")  = 0)
+        .def("to_string", &LinearAttentionConfig::to_string)
+        .def_readwrite("linear_conv_kernel_dim", &LinearAttentionConfig::linear_conv_kernel_dim)
+        .def_readwrite("linear_key_head_dim", &LinearAttentionConfig::linear_key_head_dim)
+        .def_readwrite("linear_num_key_heads", &LinearAttentionConfig::linear_num_key_heads)
+        .def_readwrite("linear_num_value_heads", &LinearAttentionConfig::linear_num_value_heads)
+        .def_readwrite("linear_value_head_dim", &LinearAttentionConfig::linear_value_head_dim);
+
+    // HybridAttentionConfig
+    py::enum_<HybridAttentionType>(m, "HybridAttentionType")
+        .value("NONE", HybridAttentionType::NONE)
+        .value("LINEAR", HybridAttentionType::LINEAR)
+        .value("SLIDING_WINDOW", HybridAttentionType::SLIDING_WINDOW);
+
+    pybind11::class_<HybridAttentionConfig>(m, "HybridAttentionConfig")
+        .def(pybind11::init<bool, std::vector<HybridAttentionType>>(),
+             pybind11::arg("enable_hybrid_attention") = false,
+             pybind11::arg("hybrid_attention_types")  = std::vector<HybridAttentionType>{})
+        .def("to_string", &HybridAttentionConfig::to_string)
+        .def_readwrite("enable_hybrid_attention", &HybridAttentionConfig::enable_hybrid_attention)
+        .def_readwrite("hybrid_attention_types", &HybridAttentionConfig::hybrid_attention_types);
+
     // Register SpeculativeType enum
     py::enum_<SpeculativeType>(m, "SpeculativeType")
         .value("NONE", SP_TYPE_NONE)
@@ -618,6 +652,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("force_score_context_attention", &SpeculativeExecutionConfig::force_score_context_attention)
         .def_readwrite("quantization", &SpeculativeExecutionConfig::quantization)
         .def_readwrite("checkpoint_path", &SpeculativeExecutionConfig::checkpoint_path)
+        .def_readwrite("use_new_sp_engine", &SpeculativeExecutionConfig::use_new_sp_engine)
         .def("to_string", [](const SpeculativeExecutionConfig& self) { return self.to_string(); })
         .def(py::pickle(
             [](const SpeculativeExecutionConfig& self) {
@@ -630,10 +665,11 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.force_stream_sample,
                                       self.force_score_context_attention,
                                       self.quantization,
-                                      self.checkpoint_path);
+                                      self.checkpoint_path,
+                                      self.use_new_sp_engine);
             },
             [](py::tuple t) {
-                if (t.size() != 10)
+                if (t.size() != 11)
                     throw std::runtime_error("Invalid state!");
                 SpeculativeExecutionConfig c;
                 try {
@@ -647,6 +683,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.force_score_context_attention = t[7].cast<bool>();
                     c.quantization                  = t[8].cast<std::string>();
                     c.checkpoint_path               = t[9].cast<std::string>();
+                    c.use_new_sp_engine             = t[10].cast<bool>();
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("SpeculativeExecutionConfig unpickle error: ") + e.what());
                 }
@@ -1119,7 +1156,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("v_head_dim", &AttentionConfigs::v_head_dim)
         .def_readwrite("softmax_extra_scale", &AttentionConfigs::softmax_extra_scale)
         .def_readwrite("kv_cache_dtype", &AttentionConfigs::kv_cache_dtype)
-        .def_readwrite("skip_append_kv_cache", &AttentionConfigs::skip_append_kv_cache);
+        .def_readwrite("skip_append_kv_cache", &AttentionConfigs::skip_append_kv_cache)
+        .def_readwrite("dtype", &AttentionConfigs::dtype);
 
     py::class_<EPLBConfig>(m, "EPLBConfig")
         .def(py::init<>())
@@ -1197,6 +1235,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("vocab_size", &ModelConfig::vocab_size)
         .def_readwrite("hidden_size", &ModelConfig::hidden_size)
         .def_readwrite("attn_config", &ModelConfig::attn_config)
+        .def_readwrite("linear_attention_config", &ModelConfig::linear_attention_config)
+        .def_readwrite("hybrid_attention_config", &ModelConfig::hybrid_attention_config)
         .def_readwrite("special_tokens", &ModelConfig::special_tokens)
         .def_readwrite("quant_algo", &ModelConfig::quant_algo)
         .def_readwrite("eplb_config", &ModelConfig::eplb_config)

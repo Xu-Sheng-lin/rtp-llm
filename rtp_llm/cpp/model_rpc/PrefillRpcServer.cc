@@ -131,8 +131,7 @@ void PrefillRpcServer::getRpcConnection(PrefillGenerateContext& prefill_context)
 
     // If no host specified in request, check if there's a master role
     char* remote_rpc_server_ip_env = std::getenv("REMOTE_RPC_SERVER_IP");
-    bool has_master_role =
-        (remote_rpc_server_ip_env != nullptr && strlen(remote_rpc_server_ip_env) > 0);
+    bool  has_master_role          = (remote_rpc_server_ip_env != nullptr && strlen(remote_rpc_server_ip_env) > 0);
 
     // If no host specified in request and no master role, this is a direct prefill request
     // In this case, we still need to select decode machines as specified in the requirements
@@ -292,6 +291,27 @@ void PrefillRpcServer::remoteGenerate(PrefillGenerateContext& prefill_context) {
     }
     generate_request.mutable_propose_token_ids()->CopyFrom(
         {stream->getProposeToken().begin(), stream->getProposeToken().end()});
+
+    auto sp_output_buffer = stream->getSPOutputBuffer();
+
+    if (sp_output_buffer) {
+        if (sp_output_buffer->all_probs->where() == rtp_llm::MemoryType::MEMORY_GPU) {
+            sp_output_buffer->all_probs =
+                engine_->getDevice()->clone({*sp_output_buffer->all_probs, rtp_llm::AllocationType::HOST});
+        }
+        if (!sp_output_buffer->hidden_states) {
+            // dummy hidden states, so datatype is not important
+            sp_output_buffer->hidden_states = engine_->getDevice()->allocateBuffer(
+                {rtp_llm::DataType::TYPE_FP16, {0}, rtp_llm::AllocationType::HOST});
+        }
+        if (sp_output_buffer->hidden_states->where() == rtp_llm::MemoryType::MEMORY_GPU) {
+            sp_output_buffer->hidden_states =
+                engine_->getDevice()->clone({*sp_output_buffer->hidden_states, rtp_llm::AllocationType::HOST});
+        }
+        QueryConverter::transTensorPB(generate_request.mutable_propose_probs(), sp_output_buffer->all_probs.get());
+        QueryConverter::transTensorPB(generate_request.mutable_propose_hidden(), sp_output_buffer->hidden_states.get());
+    }
+
     generate_request.set_stage(RemoteStage::GENERATE);
 
     CLIENT_GRPC_RET_IF_ERROR(
@@ -340,10 +360,8 @@ void PrefillRpcServer::pollRemoteOutput(PrefillGenerateContext& prefill_context)
             response.mutable_flatten_output()->mutable_aux_info(i)->set_prefill_remote_reuse_len(
                 prefill_remote_reuse_len);
 
-            response.mutable_flatten_output()->mutable_aux_info(i)->set_decode_total_reuse_len(
-                decode_total_reuse_len);
-            response.mutable_flatten_output()->mutable_aux_info(i)->set_decode_local_reuse_len(
-                decode_local_reuse_len);
+            response.mutable_flatten_output()->mutable_aux_info(i)->set_decode_total_reuse_len(decode_total_reuse_len);
+            response.mutable_flatten_output()->mutable_aux_info(i)->set_decode_local_reuse_len(decode_local_reuse_len);
             response.mutable_flatten_output()->mutable_aux_info(i)->set_decode_remote_reuse_len(
                 decode_remote_reuse_len);
         }
@@ -387,11 +405,10 @@ grpc::Status PrefillRpcServer::GenerateStreamCall(grpc::ServerContext*          
                                                   meta_);
     prefill_context.onflight_requests      = onflight_requests_;
     prefill_context.loading_cache_requests = loading_cache_requests_;
-    
 
-    auto max_retry_times                   = maga_init_params_.pd_sep_config.prefill_retry_times;
-    auto max_retry_timeout_ms              = maga_init_params_.pd_sep_config.prefill_retry_timeout_ms;
-    int  retry_interval_ms                 = 1;
+    auto max_retry_times      = maga_init_params_.pd_sep_config.prefill_retry_times;
+    auto max_retry_timeout_ms = maga_init_params_.pd_sep_config.prefill_retry_timeout_ms;
+    int  retry_interval_ms    = 1;
 
     try {
         EXECUTE_WITH_RETRY(
