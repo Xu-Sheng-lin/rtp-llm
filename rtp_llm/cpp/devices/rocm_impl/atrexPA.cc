@@ -114,6 +114,14 @@ static inline void gpuAssert(hipError_t code, const char* file, int line) {
             CALL_PA_DECODE_DOT_KERNEL(64, 8, 256, output_ptr); \
         } else if (head_sz == 64 && grp_sz == 8 && partition_sz == 512) { \
             CALL_PA_DECODE_DOT_KERNEL(64, 8, 512, output_ptr); \
+        } else if (head_sz == 64 && grp_sz == 9 && partition_sz == 256) { \
+            CALL_PA_DECODE_DOT_KERNEL(64, 9, 256, output_ptr); \
+        } else if (head_sz == 64 && grp_sz == 9 && partition_sz == 512) { \
+            CALL_PA_DECODE_DOT_KERNEL(64, 9, 512, output_ptr); \
+        } else if (head_sz == 64 && grp_sz == 10 && partition_sz == 256) { \
+            CALL_PA_DECODE_DOT_KERNEL(64, 10, 256, output_ptr); \
+        } else if (head_sz == 64 && grp_sz == 10 && partition_sz == 512) { \
+            CALL_PA_DECODE_DOT_KERNEL(64, 10, 512, output_ptr); \
         } else if (head_sz == 128 && grp_sz == 2 && partition_sz == 256) { \
             CALL_PA_DECODE_DOT_KERNEL(128, 2, 256, output_ptr); \
         } else if (head_sz == 128 && grp_sz == 2 && partition_sz == 512) { \
@@ -142,6 +150,14 @@ static inline void gpuAssert(hipError_t code, const char* file, int line) {
             CALL_PA_DECODE_DOT_KERNEL(128, 8, 256, output_ptr); \
         } else if (head_sz == 128 && grp_sz == 8 && partition_sz == 512) { \
             CALL_PA_DECODE_DOT_KERNEL(128, 8, 512, output_ptr); \
+        } else if (head_sz == 128 && grp_sz == 9 && partition_sz == 256) { \
+            CALL_PA_DECODE_DOT_KERNEL(128, 9, 256, output_ptr); \
+        } else if (head_sz == 128 && grp_sz == 9 && partition_sz == 512) { \
+            CALL_PA_DECODE_DOT_KERNEL(128, 9, 512, output_ptr); \
+        } else if (head_sz == 128 && grp_sz == 10 && partition_sz == 256) { \
+            CALL_PA_DECODE_DOT_KERNEL(128, 10, 256, output_ptr); \
+        } else if (head_sz == 128 && grp_sz == 10 && partition_sz == 512) { \
+            CALL_PA_DECODE_DOT_KERNEL(128, 10, 512, output_ptr); \
         } else { \
             throw std::runtime_error("Unsupported combination: head_size=" + std::to_string(head_sz) + \
                                    ", grp_size=" + std::to_string(grp_sz) + \
@@ -222,6 +238,26 @@ static inline void gpuAssert(hipError_t code, const char* file, int line) {
             CALL_PA_DECODE_REDUCE_KERNEL(64, 8, 16); \
         } else if (head_sz == 64 && grp_sz == 8 && partition_num == 32) { \
             CALL_PA_DECODE_REDUCE_KERNEL(64, 8, 32); \
+        } else if (head_sz == 64 && grp_sz == 9 && partition_num == 2) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 9, 2); \
+        } else if (head_sz == 64 && grp_sz == 9 && partition_num == 4) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 9, 4); \
+        } else if (head_sz == 64 && grp_sz == 9 && partition_num == 8) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 9, 8); \
+        } else if (head_sz == 64 && grp_sz == 9 && partition_num == 16) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 9, 16); \
+        } else if (head_sz == 64 && grp_sz == 9 && partition_num == 32) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 9, 32); \
+        } else if (head_sz == 64 && grp_sz == 10 && partition_num == 2) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 10, 2); \
+        } else if (head_sz == 64 && grp_sz == 10 && partition_num == 4) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 10, 4); \
+        } else if (head_sz == 64 && grp_sz == 10 && partition_num == 8) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 10, 8); \
+        } else if (head_sz == 64 && grp_sz == 10 && partition_num == 16) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 10, 16); \
+        } else if (head_sz == 64 && grp_sz == 10 && partition_num == 32) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(64, 10, 32); \
         } else if (head_sz == 128 && grp_sz == 2 && partition_num == 2) { \
             CALL_PA_DECODE_REDUCE_KERNEL(128, 2, 2); \
         } else if (head_sz == 128 && grp_sz == 2 && partition_num == 4) { \
@@ -292,6 +328,26 @@ static inline void gpuAssert(hipError_t code, const char* file, int line) {
             CALL_PA_DECODE_REDUCE_KERNEL(128, 8, 16); \
         } else if (head_sz == 128 && grp_sz == 8 && partition_num == 32) { \
             CALL_PA_DECODE_REDUCE_KERNEL(128, 8, 32); \
+        } else if (head_sz == 128 && grp_sz == 9 && partition_num == 2) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 9, 2); \
+        } else if (head_sz == 128 && grp_sz == 9 && partition_num == 4) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 9, 4); \
+        } else if (head_sz == 128 && grp_sz == 9 && partition_num == 8) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 9, 8); \
+        } else if (head_sz == 128 && grp_sz == 9 && partition_num == 16) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 9, 16); \
+        } else if (head_sz == 128 && grp_sz == 9 && partition_num == 32) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 9, 32); \
+        } else if (head_sz == 128 && grp_sz == 10 && partition_num == 2) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 10, 2); \
+        } else if (head_sz == 128 && grp_sz == 10 && partition_num == 4) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 10, 4); \
+        } else if (head_sz == 128 && grp_sz == 10 && partition_num == 8) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 10, 8); \
+        } else if (head_sz == 128 && grp_sz == 10 && partition_num == 16) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 10, 16); \
+        } else if (head_sz == 128 && grp_sz == 10 && partition_num == 32) { \
+            CALL_PA_DECODE_REDUCE_KERNEL(128, 10, 32); \
         } else { \
             throw std::runtime_error("Unsupported reduce kernel combination: head_size=" + std::to_string(head_sz) + \
                                    ", grp_size=" + std::to_string(grp_sz) + \
