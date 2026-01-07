@@ -235,15 +235,18 @@ LayernormOutput ROCmDevice::layernorm(const LayernormParams& params) {
                 auto residual_out_tensor = Buffer2torchTensor((params.before_norm_output == nullptr) ? params.input:params.before_norm_output, false);
                 layernorm2d_with_add(out_tensor, input_tensor, residual_in_tensor, residual_out_tensor, weight_tensor, beta_tensor, static_cast<double>(eps), bias_tensor);
                 if (params.return_normed_output) {
-                    copy({*torchTensor2Buffer(residual_out_tensor), *norm_output});
+                    auto residual_out_buffer = torchTensor2Buffer(residual_out_tensor);
+		    norm_output->swap(*residual_out_buffer);
                 }
             }
             else
             {
                 auto res_tensor = layernorm2d(input_tensor, weight_tensor, beta_tensor, static_cast<double>(eps), bias_tensor);
-                copy({*norm_output, *torchTensor2Buffer(res_tensor)});
-                if (params.return_normed_output) {
-                    copy({*params.before_norm_output, *torchTensor2Buffer(res_tensor)});
+                auto res_buffer = torchTensor2Buffer(res_tensor);
+		            res_buffer->swap(*norm_output);
+		if (params.return_normed_output) {
+		    auto res_buffer = torchTensor2Buffer(res_tensor);
+                    res_buffer->swap(*params.before_norm_output);
                 }
             }
         }
@@ -286,8 +289,9 @@ LayernormOutput ROCmDevice::layernorm(const LayernormParams& params) {
                 }
                 else
                 {
-                    auto res_tensor = rmsnorm2d(input_tensor, weight_tensor, static_cast<double>(eps), 0);
-                    copy({*norm_output, *torchTensor2Buffer(res_tensor)});
+		    auto res_tensor = rmsnorm2d(input_tensor, weight_tensor, static_cast<double>(eps), 0);
+		    auto res_buffer = torchTensor2Buffer(res_tensor);
+                    res_buffer->swap(*norm_output);
                 }
             }
         }
