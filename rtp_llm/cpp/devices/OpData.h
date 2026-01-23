@@ -615,6 +615,10 @@ struct AttentionModuleParams {
     const AttentionConfigs&      configs;
     const QScheme                qscheme;
     const DataType               compute_type = DataType::TYPE_INVALID;
+
+    const BufferPtr& exp_sums_buffer;
+    const BufferPtr& max_logits_buffer;
+    const BufferPtr& tmp_out_buffer;
 };
 
 struct MlaRotaryWriteKVCacheParams {
@@ -699,6 +703,10 @@ struct AttentionLayerParams {
     const DataType               compute_type;
     bool                         enable_sp;
     size_t                       pad_token_num;
+
+    BufferPtr exp_sums_buffer;
+    BufferPtr max_logits_buffer;
+    BufferPtr tmp_out_buffer;
 };
 
 struct MoeConfigs {

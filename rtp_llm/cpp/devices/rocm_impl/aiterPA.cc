@@ -67,6 +67,8 @@ void runAiterAsmPA(const AttentionModuleParams& params, rtp_llm::DeviceBase* dev
 }
 
 void runAiterPA(const AttentionModuleParams& params, rtp_llm::DeviceBase* device, Buffer& q_tmp) {
+    auto total_start = std::chrono::high_resolution_clock::now();
+
     auto out   = Buffer2torchTensor(params.output, false);
     auto query = Buffer2torchTensor(q_tmp, false);
 
@@ -84,19 +86,14 @@ void runAiterPA(const AttentionModuleParams& params, rtp_llm::DeviceBase* device
         device->nativeGraphCapturing() ? device->initParams().max_seq_len : params.common.decoder_max_seq_len + 1;
     size_t    max_num_partitions = (max_seq_len + partition_size - 1) / partition_size;
     auto      datatype           = params.output.type();
-    BufferPtr exp_sums_buffer    = device->allocateBuffer(
-        {rtp_llm::DataType::TYPE_FP32, {num_seqs, num_heads, max_num_partitions}, AllocationType::DEVICE},
-        {"exp_sums"});
-    auto exp_sums = Buffer2torchTensor(exp_sums_buffer, false);
 
-    BufferPtr max_logits_buffer = device->allocateBuffer(
-        {rtp_llm::DataType::TYPE_FP32, {num_seqs, num_heads, max_num_partitions}, AllocationType::DEVICE},
-        {"max_logits"});
-    auto max_logits = Buffer2torchTensor(max_logits_buffer, false);
+    auto exp_sums = Buffer2torchTensor(params.exp_sums_buffer, false);
+    auto max_logits = Buffer2torchTensor(params.max_logits_buffer, false);
+    auto tmp_out = Buffer2torchTensor(params.tmp_out_buffer, false);
 
-    BufferPtr tmp_out_buffer = device->allocateBuffer(
-        {datatype, {num_seqs, num_heads, max_num_partitions, head_size}, AllocationType::DEVICE}, {"tmp_out"});
-    auto tmp_out = Buffer2torchTensor(tmp_out_buffer, false);
+    auto after_alloc = std::chrono::high_resolution_clock::now();
+    auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(after_alloc - total_start).count();
+    std::cout << "[runAiterPA] buffer allocation time: " << alloc_us << " 微秒" << std::endl;
 
     auto key_cache   = Buffer2torchTensor(params.common.kv_cache->kv_cache_buffer, false).select(1, 0);
     auto value_cache = Buffer2torchTensor(params.common.kv_cache->kv_cache_buffer, false).select(1, 1);
@@ -128,6 +125,12 @@ void runAiterPA(const AttentionModuleParams& params, rtp_llm::DeviceBase* device
     //                                              max_num_blocks_per_seq,
     //                                             }, 0);
 
+    auto after_kv_view = std::chrono::high_resolution_clock::now();
+    auto kv_view_us = std::chrono::duration_cast<std::chrono::microseconds>(after_kv_view - after_alloc).count();
+    std::cout << "[runAiterPA] kv_cache tensor/view prepare time: " << kv_view_us << " 微秒" << std::endl;
+
+    auto kernel_start = std::chrono::high_resolution_clock::now();
+
     auto aiter_attn = (AiterAttnParams*)params.common.decode_aiter_attn.get();
     if (!aiter_attn) {
         throw std::runtime_error("aiter_attn must be setting when using aiter pa");
@@ -135,6 +138,7 @@ void runAiterPA(const AttentionModuleParams& params, rtp_llm::DeviceBase* device
 
     auto context_lens = aiter_attn->sequence_lengths_t;
     if (max_seq_len <= 16384) {
+
         int64_t x        = 16 / key_cache.element_size();
         auto    kv_sizes = value_cache.sizes();
         out              = out.view({int64_t(num_seqs), int64_t(num_heads), int64_t(head_size)});
@@ -157,23 +161,29 @@ void runAiterPA(const AttentionModuleParams& params, rtp_llm::DeviceBase* device
                               scale,
                               max_seq_len,
                               alibi_slopes);
+
+        auto after_kernel = std::chrono::high_resolution_clock::now();
+        auto kernel_us = std::chrono::duration_cast<std::chrono::microseconds>(after_kernel - kernel_start).count();
+        std::cout << "[runAiterPA] paged_attention_atrex execution time: "
+                  << kernel_us << " 微秒" << std::endl;
+
     } else {
         partition_size = 256;
         max_seq_len =
             device->nativeGraphCapturing() ? device->initParams().max_seq_len : params.common.decoder_max_seq_len + 1;
         max_num_partitions = (max_seq_len + partition_size - 1) / partition_size;
         datatype           = params.output.type();
-        exp_sums_buffer    = device->allocateBuffer(
+        BufferPtr exp_sums_buffer    = device->allocateBuffer(
             {rtp_llm::DataType::TYPE_FP32, {num_seqs, num_heads, max_num_partitions}, AllocationType::DEVICE},
             {"exp_sums"});
         exp_sums = Buffer2torchTensor(exp_sums_buffer, false);
 
-        max_logits_buffer = device->allocateBuffer(
+        BufferPtr max_logits_buffer = device->allocateBuffer(
             {rtp_llm::DataType::TYPE_FP32, {num_seqs, num_heads, max_num_partitions}, AllocationType::DEVICE},
             {"max_logits"});
         max_logits = Buffer2torchTensor(max_logits_buffer, false);
 
-        tmp_out_buffer = device->allocateBuffer(
+        BufferPtr tmp_out_buffer = device->allocateBuffer(
             {datatype, {num_seqs, num_heads, max_num_partitions, head_size}, AllocationType::DEVICE}, {"tmp_out"});
         tmp_out = Buffer2torchTensor(tmp_out_buffer, false);
         paged_attention(out,

@@ -106,6 +106,9 @@ struct GptLayerInputs {
     size_t                             pad_token_num   = 0;
     BufferPtr                          residual        = nullptr;
     bool                               need_moe_gating = false;
+    rtp_llm::BufferPtr exp_sums_buffer;
+    rtp_llm::BufferPtr max_logits_buffer;
+    rtp_llm::BufferPtr tmp_out_buffer;
 };
 
 struct AttentionBlockOutputs {

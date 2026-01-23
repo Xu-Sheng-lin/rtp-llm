@@ -728,32 +728,72 @@ GptLayerInputs GptModel::forwardPreLayers(const GptModelInputs& inputs) {
     if (device_->initParams().profile_debug_logging_config.check_nan) {
         (void)device_->checkNAN(*hidden);
     }
-    if (int(device_props_.enable_layer_micro_batch)) {
+   
+    bool enable_micro_batch = static_cast<bool>(device_props_.enable_layer_micro_batch);
+
+    AttentionCommonInputs              attention_common_inputs;
+    std::vector<LayerMicroBatchInputs> micro_batch_inputs;
+
+    if (enable_micro_batch) {
         auto micro_batch_plan = planMicroBatches(inputs);
-        auto micro_batch_inputs =
-            prepareMicroBatchInputs(inputs, hidden, pre_decoder_residual, attn_dtype, micro_batch_plan);
-        return {move(hidden),
-                move(pre_decoder_residual),
-                AttentionCommonInputs(),
-                hidden_dtype,
-                micro_batch_inputs,
-                enable_sp,
-                token_num,
-                pad_token_num,
-                output.residual};
+        micro_batch_inputs =
+            prepareMicroBatchInputs(inputs,
+                                    hidden,
+                                    pre_decoder_residual,
+                                    attn_dtype,
+                                    micro_batch_plan);
+        attention_common_inputs = AttentionCommonInputs{};
     } else {
-        // prepare resources for all layers
-        auto attention_common_inputs = prepareAttentionInputs(inputs, attn_dtype, combo_position_ids);
-        return {move(hidden),
-                move(pre_decoder_residual),
-                move(attention_common_inputs),
-                hidden_dtype,
-                {},
-                enable_sp,
-                token_num,
-                pad_token_num,
-                output.residual};
+        attention_common_inputs =
+            prepareAttentionInputs(inputs, attn_dtype, combo_position_ids);
     }
+
+    size_t  num_heads      = description_.attention_conf.head_num;
+    size_t  head_size      = description_.attention_conf.size_per_head;
+    int64_t partition_size = 512;
+    int64_t max_seq_len =
+        device_->nativeGraphCapturing()
+            ? device_->initParams().max_seq_len
+            : attention_common_inputs.decoder_max_seq_len + 1;
+
+    size_t    max_num_partitions = (max_seq_len + partition_size - 1) / partition_size;
+    BufferPtr exp_sums_buffer    = device_->allocateBuffer(
+        {rtp_llm::DataType::TYPE_FP32,
+        {token_num, num_heads, max_num_partitions},
+        AllocationType::DEVICE},
+        {"exp_sums"});
+    BufferPtr max_logits_buffer = device_->allocateBuffer(
+        {rtp_llm::DataType::TYPE_FP32,
+        {token_num, num_heads, max_num_partitions},
+        AllocationType::DEVICE},
+        {"max_logits"});
+    BufferPtr tmp_out_buffer = device_->allocateBuffer(
+        {attn_dtype,
+        {token_num, num_heads, max_num_partitions, head_size},
+        AllocationType::DEVICE},
+        {"tmp_out"});
+
+    rtp_llm::GptLayerInputs layer_inputs{
+        std::move(hidden),
+        std::move(pre_decoder_residual),
+        std::move(attention_common_inputs),
+        hidden_dtype,
+        {},
+        enable_sp,
+        token_num,
+        pad_token_num,
+        output.residual,
+        false,
+        exp_sums_buffer,
+        max_logits_buffer,
+        tmp_out_buffer,
+    };
+
+    if (enable_micro_batch) {
+        layer_inputs.micro_batch_inputs = std::move(micro_batch_inputs);
+    }
+
+    return layer_inputs;
 }
 
 vector<GptLayerInputs> GptModel::forwardPrefillMicroBatchedLayers(vector<GptLayerInputs>  micro_batch_layer_inputs,
@@ -1385,7 +1425,10 @@ AttentionBlockOutputs GptModel::forwardAttentionBlock(const GptLayerInputs&     
                               description_.act_qscheme,
                               description_.compute_type,
                               enable_sp,
-                              inputs.pad_token_num});
+                              inputs.pad_token_num,
+                              inputs.exp_sums_buffer,
+                              inputs.max_logits_buffer,
+                              inputs.tmp_out_buffer});
     if (description_.attention_conf.use_mla && device_->mla_ops_type != rtp_llm::MlaOpsType::MHA) {
         attn_output = device_->mlaAttentionLayer(attn_params);
     } else {

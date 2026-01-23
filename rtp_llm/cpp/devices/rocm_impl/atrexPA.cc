@@ -6,6 +6,8 @@
 #include <hip/hip_bf16.h>
 #include "atrexPA.h"
 
+#include <chrono>
+
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
 // helpers to check for hip errors
@@ -353,8 +355,6 @@ static inline void gpuAssert(hipError_t code, const char* file, int line) {
             CALL_PA_DECODE_REDUCE_KERNEL(128, 6, 16);                                                                  \
         } else if (head_sz == 128 && grp_sz == 6 && partition_num == 32) {                                             \
             CALL_PA_DECODE_REDUCE_KERNEL(128, 6, 32);                                                                  \
-        } else if (head_sz == 128 && grp_sz == 7 && partition_num == 2) {                                              \
-            CALL_PA_DECODE_REDUCE_KERNEL(128, 7, 2);                                                                   \
         } else if (head_sz == 128 && grp_sz == 7 && partition_num == 4) {                                              \
             CALL_PA_DECODE_REDUCE_KERNEL(128, 7, 4);                                                                   \
         } else if (head_sz == 128 && grp_sz == 7 && partition_num == 8) {                                              \
@@ -453,6 +453,8 @@ void paged_attention_atrex(torch::Tensor&                      out,
                            float                               scale,
                            int64_t                             max_context_len,
                            const std::optional<torch::Tensor>& alibi_slopes) {
+    auto t_func_start = std::chrono::high_resolution_clock::now();
+
     int num_kv_heads = key_cache.size(1);
     int num_seqs     = query.size(0);
     int num_q_heads  = query.size(1);
@@ -460,7 +462,6 @@ void paged_attention_atrex(torch::Tensor&                      out,
     int head_sz      = query.size(2);
     int query_grp_sz = num_q_heads / num_kv_heads;
 
-    // NOTE: alibi_slopes is optional.
     hipDeviceptr_t alibi_slopes_ptr =
         alibi_slopes ? reinterpret_cast<hipDeviceptr_t>(alibi_slopes.value().data_ptr()) : nullptr;
     float*          exp_sums_ptr     = reinterpret_cast<float*>(exp_sums.data_ptr());
@@ -475,22 +476,71 @@ void paged_attention_atrex(torch::Tensor&                      out,
 
     const hipStream_t stream = at::hip::getCurrentHIPStream().stream();
 
+    // 方便调试参数
+    std::cout << "[paged_attention_atrex] num_seqs=" << num_seqs
+              << ", num_kv_heads=" << num_kv_heads
+              << ", num_q_heads=" << num_q_heads
+              << ", head_sz=" << head_sz
+              << ", query_grp_sz=" << query_grp_sz
+              << ", max_context_len=" << max_context_len
+              << std::endl;
+
+    auto t_prepare_end = std::chrono::high_resolution_clock::now();
+
+    auto prepare_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_prepare_end - t_func_start).count();
+    std::cout << "[paged_attention_atrex] prepare(ptrs & sizes) time: "
+              << prepare_us << " 微秒" << std::endl;
+
     if (max_context_len <= 256) {
         std::vector<int32_t> grid = {num_seqs, num_kv_heads, 1};
+
+        auto t_kernel_start = std::chrono::high_resolution_clock::now();
         DISPATCH_HEAD_GRP_PARTITION(head_sz, query_grp_sz, 256, out_ptr);
+        // hipStreamSynchronize(stream);
     } else if (max_context_len <= 512) {
         std::vector<int32_t> grid = {num_seqs, num_kv_heads, 1};
+
+        auto t_kernel_start = std::chrono::high_resolution_clock::now();
         DISPATCH_HEAD_GRP_PARTITION(head_sz, query_grp_sz, 512, out_ptr);
+        // hipStreamSynchronize(stream);
     } else {
-        constexpr int        _SEQ_PARTITION_SIZE = 512;
-        int                  max_num_partitions  = (max_context_len + _SEQ_PARTITION_SIZE - 1) / _SEQ_PARTITION_SIZE;
-        std::vector<int32_t> grid                = {num_seqs, num_kv_heads, max_num_partitions};
+        constexpr int _SEQ_PARTITION_SIZE = 512;
+        int           max_num_partitions =
+            (max_context_len + _SEQ_PARTITION_SIZE - 1) / _SEQ_PARTITION_SIZE;
+        std::vector<int32_t> grid = {num_seqs, num_kv_heads, max_num_partitions};
+
+        std::cout << "[paged_attention_atrex] long ctx: _SEQ_PARTITION_SIZE="
+                  << _SEQ_PARTITION_SIZE
+                  << ", max_num_partitions=" << max_num_partitions << std::endl;
 
         DISPATCH_HEAD_GRP_PARTITION(head_sz, query_grp_sz, 512, tmp_out_ptr);
+        // hipStreamSynchronize(stream);
+        auto t_kernel_part_end = std::chrono::high_resolution_clock::now();
 
-        std::vector<int32_t> grid1                    = {num_seqs, num_kv_heads, 1};
+        std::vector<int32_t> grid1 = {num_seqs, num_kv_heads, 1};
         const auto           max_num_partitions_pow_2 = next_power_of_2(max_num_partitions);
 
+        std::cout << "[paged_attention_atrex] max_num_partitions_pow_2="
+                  << max_num_partitions_pow_2 << std::endl;
+                  
         DISPATCH_REDUCE_KERNEL(head_sz, query_grp_sz, max_num_partitions_pow_2);
+        // hipStreamSynchronize(stream);
+        auto t_kernel_reduce_end = std::chrono::high_resolution_clock::now();
+
+        auto part_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_kernel_part_end - t_prepare_end).count();
+        auto reduce_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_kernel_reduce_end - t_kernel_part_end).count();
+        auto branch_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(t_kernel_reduce_end - t_prepare_end).count();
+
+        std::cout << "[paged_attention_atrex] branch(max_ctx>512) partition kernel time: "
+                  << part_us << " 微秒" << std::endl;
+        std::cout << "[paged_attention_atrex] branch(max_ctx>512) reduce kernel time: "
+                  << reduce_us << " 微秒" << std::endl;
+        std::cout << "[paged_attention_atrex] branch(max_ctx>512) total time: "
+                  << branch_us << " 微秒" << std::endl;
     }
 }
+

@@ -132,7 +132,10 @@ BufferPtr DeviceBase::attentionAttn(const AttentionLayerParams& params) {
                               params.weights,
                               params.configs,
                               params.qscheme,
-                              params.compute_type});
+                              params.compute_type,
+                              params.exp_sums_buffer,
+                              params.max_logits_buffer,
+                              params.tmp_out_buffer});
     }
     if (context_batch_size) {
         auto context_qkv    = qkv.view(generate_batch_size, context_token_num);
@@ -148,7 +151,10 @@ BufferPtr DeviceBase::attentionAttn(const AttentionLayerParams& params) {
                           params.weights,
                           params.configs,
                           params.qscheme,
-                          params.compute_type});
+                          params.compute_type,
+                          params.exp_sums_buffer,
+                          params.max_logits_buffer,
+                          params.tmp_out_buffer});
     }
     if (layer_kv_cache) {
         params.common.kv_cache->kv_cache_block_id = kv_cache_block_id;
@@ -242,7 +248,10 @@ AttentionLayerOutput DeviceBase::attentionLayer(const AttentionLayerParams& para
                                         params.qscheme,
                                         params.compute_type,
                                         params.enable_sp,
-                                        params.pad_token_num});
+                                        params.pad_token_num,
+                                        params.exp_sums_buffer,
+                                        params.max_logits_buffer,
+                                        params.tmp_out_buffer});
     return {attentionOutGemm({params.layer_id,
                               *attn_out,
                               params.output,
@@ -254,7 +263,10 @@ AttentionLayerOutput DeviceBase::attentionLayer(const AttentionLayerParams& para
                               params.qscheme,
                               params.compute_type,
                               params.enable_sp,
-                              params.pad_token_num})};
+                              params.pad_token_num,
+                              params.exp_sums_buffer,
+                              params.max_logits_buffer,
+                              params.tmp_out_buffer})};
 }
 
 };  // namespace rtp_llm

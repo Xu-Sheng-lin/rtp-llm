@@ -1251,11 +1251,19 @@ AttentionModuleOutput ROCmDevice::decoderSelfAttention(const AttentionModulePara
             }
             check_cuda_error();
             DEBUG_PRINT_PARAMS(params, this, "decode_writeKVCache", q_output);
+
+            auto start_time = std::chrono::high_resolution_clock::now();
+
             if (init_params_.use_asm_pa) {
                 runAiterAsmPA(params, this, *q_output);
             } else {
                 runAiterPA(params, this, *q_output);
             }
+
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+            std::cout << "runAiterPA execution time: " << duration << " 微秒" << std::endl;
+
             check_cuda_error();
         }
     } else {
