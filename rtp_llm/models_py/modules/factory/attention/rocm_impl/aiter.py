@@ -146,17 +146,20 @@ class AiterPrefillAttnOp:
 
     def reshape_qkv(self, qkv):
         """Reshape qkv tensor(s) to the format expected by flash attention."""
-        if isinstance(qkv, (tuple, list)) and len(qkv) == 3 and qkv[0].dim() == 3:
-            q_contiguous = qkv[0].permute(1, 0, 2).contiguous()
-            k_contiguous = qkv[1].permute(1, 0, 2).contiguous()
-            v_contiguous = qkv[2].permute(1, 0, 2).contiguous()
-            q_contiguous = q_contiguous[: self.fmha_params.token_q_num]
-            k_contiguous = k_contiguous[: self.fmha_params.token_kv_num]
-            v_contiguous = v_contiguous[: self.fmha_params.token_kv_num]
-            return q_contiguous, k_contiguous, v_contiguous
-
-        if isinstance(qkv, (tuple, list)) and len(qkv) == 3 and qkv[0].dim() == 2:
-            qkv = qkv[0]
+        if isinstance(qkv, (tuple, list)) and len(qkv) == 3:
+            if qkv[0] is None or qkv[1] is None or qkv[2] is None:
+                # Some elements are None, use only the first one
+                qkv = qkv[0]
+            elif qkv[0].dim() == 3:
+                q_contiguous = qkv[0].permute(1, 0, 2).contiguous()
+                k_contiguous = qkv[1].permute(1, 0, 2).contiguous()
+                v_contiguous = qkv[2].permute(1, 0, 2).contiguous()
+                q_contiguous = q_contiguous[: self.fmha_params.token_q_num]
+                k_contiguous = k_contiguous[: self.fmha_params.token_kv_num]
+                v_contiguous = v_contiguous[: self.fmha_params.token_kv_num]
+                return q_contiguous, k_contiguous, v_contiguous
+            elif qkv[0].dim() == 2:
+                qkv = qkv[0]
 
         tokens = qkv.size(0)
         q_size = self.head_num * self.head_dim
