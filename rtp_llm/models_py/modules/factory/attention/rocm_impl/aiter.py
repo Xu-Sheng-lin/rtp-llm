@@ -146,9 +146,21 @@ class AiterPrefillAttnOp:
 
     def reshape_qkv(self, qkv):
         """Reshape qkv tensor(s) to the format expected by flash attention."""
+        logging.warning(
+            f"[DEBUG reshape_qkv] qkv type={type(qkv)}, "
+            f"is_tuple={isinstance(qkv, (tuple, list))}, "
+            f"len={len(qkv) if isinstance(qkv, (tuple, list)) else 'N/A'}, "
+            f"shape={qkv.shape if hasattr(qkv, 'shape') else 'N/A'}, "
+            f"dim={qkv.dim() if hasattr(qkv, 'dim') else 'N/A'}"
+        )
         if isinstance(qkv, (tuple, list)) and len(qkv) == 3:
+            logging.warning(
+                f"[DEBUG reshape_qkv] tuple elements: "
+                f"q.shape={qkv[0].shape if qkv[0] is not None else None}, "
+                f"k.shape={qkv[1].shape if qkv[1] is not None else None}, "
+                f"v.shape={qkv[2].shape if qkv[2] is not None else None}"
+            )
             if qkv[0] is None or qkv[1] is None or qkv[2] is None:
-                # Some elements are None, use only the first one
                 qkv = qkv[0]
             elif qkv[0].dim() == 3:
                 q_contiguous = qkv[0].permute(1, 0, 2).contiguous()
@@ -315,6 +327,55 @@ class AiterPrefillAttnOp:
 
         if kv_cache is None:
             return self._forward_varlen(qkv, fmha_params)
+
+        # Handle (Q, None, None) case: extract K/V from KV cache
+        if isinstance(qkv, (tuple, list)) and len(qkv) == 3 and qkv[0] is not None and qkv[1] is None:
+            q_tensor = qkv[0]  # [tokens, head_num, head_dim]
+            device = q_tensor.device
+
+            # Extract K/V from 5D KV cache: [block_num, 2, kv_heads, page_size, head_dim]
+            kv_base = kv_cache.kv_cache_base
+            k_4d = kv_base[:, 0, :, :, :]  # [block_num, kv_heads, page_size, head_dim]
+            v_4d = kv_base[:, 1, :, :, :]  # [block_num, kv_heads, page_size, head_dim]
+
+            # Get the first block's K/V for the current sequence
+            # seqlen_k tells us how many tokens
+            cu_seqlens_k = fmha_params.cu_seqlens_k.to(device)
+            seq_len = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+
+            # Extract K/V for the current sequence and repeat for GQA
+            k_seq = k_4d[0, :, :seq_len, :].contiguous()  # [kv_heads, seq_len, head_dim]
+            v_seq = v_4d[0, :, :seq_len, :].contiguous()  # [kv_heads, seq_len, head_dim]
+
+            # Repeat for GQA: [kv_heads, seq, hd] -> [q_heads, seq, hd]
+            if self.head_num_kv < self.head_num:
+                repeat_factor = self.head_num // self.head_num_kv
+                k_tensor = k_seq.repeat_interleave(repeat_factor, dim=0)
+                v_tensor = v_seq.repeat_interleave(repeat_factor, dim=0)
+            else:
+                k_tensor = k_seq
+                v_tensor = v_seq
+
+            # Transpose to [seq, heads, hd]
+            q_tensor = q_tensor.contiguous()
+            k_tensor = k_tensor.transpose(0, 1).contiguous()
+            v_tensor = v_tensor.transpose(0, 1).contiguous()
+
+            cu_seqlens_q = fmha_params.cu_seqlens_q.to(device)
+            cu_seqlens_k = fmha_params.cu_seqlens_k.to(device)
+
+            res = aiter.flash_attn_varlen_func(
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                fmha_params.max_seqlen_q,
+                fmha_params.max_seqlen_k,
+                dropout_p=0.0,
+                causal=self.is_causal,
+            )
+            return res.reshape(fmha_params.token_q_num, self.head_num * self.head_dim)
 
         # Use flash_attn_varlen_func (same path as qwen35-0331 branch)
         q_tensor, k_tensor, v_tensor = self.reshape_qkv(qkv)
@@ -773,7 +834,10 @@ class AiterDecodeAttnOpNonAsm(AiterDecodeAttnOpBase):
         num_kv_heads = self.head_num_kv
         num_seqs, num_heads, head_size = query.shape
         block_size = value_cache.shape[2]
-        if max_seq_len <= 16384 and (not using_fp8_kvcache):
+        # TODO(wenhua): avoid asd pa accuracy in qwen35
+        # if max_seq_len <= 16384 and (not using_fp8_kvcache):
+        output = torch.empty_like(query).view((num_seqs, num_heads, head_size))
+        if False:
             _PARTITION_SIZE_ROCM = 512
             max_num_partitions = (
                 max_seq_len + _PARTITION_SIZE_ROCM - 1
