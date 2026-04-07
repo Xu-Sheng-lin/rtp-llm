@@ -144,6 +144,32 @@ class AiterPrefillAttnOp:
         )
         return self.fmha_params
 
+    def reshape_qkv(self, qkv):
+        """Reshape qkv tensor(s) to the format expected by flash attention."""
+        if isinstance(qkv, (tuple, list)) and len(qkv) == 3 and qkv[0].dim() == 3:
+            q_contiguous = qkv[0].permute(1, 0, 2).contiguous()
+            k_contiguous = qkv[1].permute(1, 0, 2).contiguous()
+            v_contiguous = qkv[2].permute(1, 0, 2).contiguous()
+            q_contiguous = q_contiguous[: self.fmha_params.token_q_num]
+            k_contiguous = k_contiguous[: self.fmha_params.token_kv_num]
+            v_contiguous = v_contiguous[: self.fmha_params.token_kv_num]
+            return q_contiguous, k_contiguous, v_contiguous
+
+        if isinstance(qkv, (tuple, list)) and len(qkv) == 3 and qkv[0].dim() == 2:
+            qkv = qkv[0]
+
+        tokens = qkv.size(0)
+        q_size = self.head_num * self.head_dim
+        kv_size = self.head_num_kv * self.head_dim
+        q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+        q = q.view(tokens, self.head_num, self.head_dim)
+        k = k.view(tokens, self.head_num_kv, self.head_dim)
+        v = v.view(tokens, self.head_num_kv, self.head_dim)
+        q = q[: self.fmha_params.token_q_num]
+        k = k[: self.fmha_params.token_kv_num]
+        v = v[: self.fmha_params.token_kv_num]
+        return q.contiguous(), k.contiguous(), v.contiguous()
+
     def _reshape_kv_cache_vectorized(self, kv_cache_base):
         """Reshape kv_cache_base into 5D VECTORIZED_LAYOUT for mha_batch_prefill.
 
@@ -287,53 +313,22 @@ class AiterPrefillAttnOp:
         if kv_cache is None:
             return self._forward_varlen(qkv, fmha_params)
 
-        # Use CK mha_batch_prefill for prefill (query_length > 4)
-        k_cache, v_cache = self._reshape_kv_cache_vectorized(kv_cache.kv_cache_base)
-        block_table = fmha_params.kv_cache_block_id_device
+        # Use flash_attn_varlen_func (same path as qwen35-0331 branch)
+        q_tensor, k_tensor, v_tensor = self.reshape_qkv(qkv)
+
         cu_seqlens_q = fmha_params.cu_seqlens_q.to(q_tensor.device)
+        cu_seqlens_k = fmha_params.cu_seqlens_k.to(k_tensor.device)
 
-        # prefix_lengths: default to zeros when no prefix (unified logic)
-        batch_size = cu_seqlens_q.shape[0] - 1
-        if (
-            fmha_params.prefix_lengths is not None
-            and fmha_params.prefix_lengths.numel() > 0
-        ):
-            prefix_lengths_device = fmha_params.prefix_lengths.to(q_tensor.device)
-        else:
-            prefix_lengths_device = torch.zeros(
-                batch_size, dtype=torch.int32, device=q_tensor.device
-            )
-
-        input_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        seqlen_k = (prefix_lengths_device + input_lengths).to(torch.int32)
-
-        softmax_scale = 1.0 / math.sqrt(self.head_dim)
-        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=q_tensor.device)
-        kv_page_indices = torch.zeros(1, dtype=torch.int32, device=q_tensor.device)
-
-        logging.warning(
-            f"[DEBUG mha_batch_prefill] q_tensor.shape={q_tensor.shape} dtype={q_tensor.dtype}, "
-            f"k_cache.shape={k_cache.shape} dtype={k_cache.dtype}, "
-            f"v_cache.shape={v_cache.shape} dtype={v_cache.dtype}, "
-            f"block_table.shape={block_table.shape if block_table is not None else None}, "
-            f"cu_seqlens_q={cu_seqlens_q}, kv_indptr={kv_indptr}, "
-            f"kv_page_indices={kv_page_indices}, "
-            f"head_num={self.head_num}, head_num_kv={self.head_num_kv}, "
-            f"head_dim={self.head_dim}, tokens_per_block={self.tokens_per_block}"
-        )
-
-        res = aiter.mha_batch_prefill_func(
+        res = aiter.flash_attn_varlen_func(
             q_tensor,
-            k_cache,
-            v_cache,
+            k_tensor,
+            v_tensor,
             cu_seqlens_q,
-            kv_indptr,
-            kv_page_indices,
+            cu_seqlens_k,
             fmha_params.max_seqlen_q,
             fmha_params.max_seqlen_k,
-            causal=True,
-            block_table=block_table.to(dtype=torch.int32, device=q_tensor.device),
-            seqlen_k=seqlen_k,
+            dropout_p=0.0,
+            causal=self.is_causal,
         )
         return res.reshape(fmha_params.token_q_num, self.head_num * self.head_dim)
 
