@@ -62,10 +62,22 @@ class TopKWeightAndReduceNaiveBatched(object):
         for expert_id in range(first_expert, last_expert):
             matching_tokens = topk_ids == expert_id
             topks = torch.any(matching_tokens, dim=1).flatten()
-            rows = torch.count_nonzero(matching_tokens)
-            rhs = fused_expert_output[expert_id - first_expert, :rows, :]
+            num_matched_tokens = topks.sum().item()
+            if num_matched_tokens == 0:
+                continue
+            rhs = fused_expert_output[expert_id - first_expert, :num_matched_tokens, :]
             if not apply_router_weight_on_input:
-                rhs.mul_(topk_weights[matching_tokens].view(rhs.size(0), 1))
+                token_weights = topk_weights[matching_tokens]
+                if token_weights.numel() == num_matched_tokens:
+                    rhs.mul_(token_weights.view(-1, 1))
+                else:
+                    per_token_weights = torch.zeros(num_matched_tokens, device=topk_weights.device)
+                    idx = 0
+                    for t in range(topk_ids.size(0)):
+                        if topks[t]:
+                            per_token_weights[idx] = topk_weights[t, matching_tokens[t]].sum()
+                            idx += 1
+                    rhs.mul_(per_token_weights.view(-1, 1))
             output[topks] = output[topks] + rhs
 
         return output
