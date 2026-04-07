@@ -125,7 +125,12 @@ class AiterPrefillAttnOp:
         self.head_num = attn_configs.head_num
         self.head_dim = attn_configs.size_per_head
         self.head_num_kv = attn_configs.kv_head_num
-        self.tokens_per_block = attn_configs.tokens_per_block
+        # Use kernel_tokens_per_block if available, otherwise fallback to tokens_per_block
+        self.tokens_per_block = (
+            attn_configs.kernel_tokens_per_block
+            if attn_configs.kernel_tokens_per_block > 0
+            else attn_configs.tokens_per_block
+        )
         self.is_causal = attn_configs.is_causal
         self.v1_kv_layout = v1_kv_layout
 
@@ -145,15 +150,39 @@ class AiterPrefillAttnOp:
         Returns (k_cache_5d, v_cache_5d):
             K: [num_blocks, num_kv_heads, head_dim/vs, page_size, vs]
             V: [num_blocks, num_kv_heads, page_size/vs, head_dim, vs]
+
+        Note: kv_cache_base can be in one of two formats:
+        1. Flat format: [num_blocks, 2 * num_kv_heads * page_size * head_dim]
+        2. Kernel layout: [num_blocks, 2, num_kv_heads, page_size, head_dim]
         """
         block_num = kv_cache_base.shape[0]
         hk = self.head_num_kv
         ps = self.tokens_per_block
         hd = self.head_dim
         vs = 16 // kv_cache_base.element_size()
-        expected_elems = 2 * hk * ps * hd
 
-        flat = kv_cache_base[:, :expected_elems].reshape(block_num, 2, hk, ps * hd)
+        # Detect format based on number of dimensions
+        if kv_cache_base.dim() == 2:
+            # Flat format: [num_blocks, 2 * num_kv_heads * page_size * head_dim]
+            # Use actual size from tensor instead of computed value
+            flat_size = kv_cache_base.shape[1]
+            logging.warning(
+                f"[DEBUG reshape 2D] block_num={block_num}, flat_size={flat_size}, "
+                f"hk={hk}, ps={ps}, hd={hd}, vs={vs}, "
+                f"expected_2hk_ps_hd={2 * hk * ps * hd}"
+            )
+            flat = kv_cache_base[:, :flat_size].reshape(block_num, 2, hk, flat_size // (2 * hk))
+        elif kv_cache_base.dim() == 5:
+            # Kernel layout: [num_blocks, 2, num_kv_heads, page_size, head_dim]
+            # Read actual page_size and head_dim from tensor shape, not config
+            actual_ps = kv_cache_base.shape[3]
+            actual_hd = kv_cache_base.shape[4]
+            flat = kv_cache_base.reshape(block_num, 2, hk, actual_ps * actual_hd)
+            # Override ps and hd with actual values from tensor for subsequent view ops
+            ps = actual_ps
+            hd = actual_hd
+        else:
+            raise ValueError(f"Unexpected kv_cache_base shape: {kv_cache_base.shape}")
 
         # K: V1 kernel writes via getKLocalIdx<BASE> → vectorized [hd//vs, ps, vs].
         # This matches the target 5D shape directly via view.
@@ -258,7 +287,7 @@ class AiterPrefillAttnOp:
         if kv_cache is None:
             return self._forward_varlen(qkv, fmha_params)
 
-        # Unified path: always use mha_batch_prefill from paged KV cache
+        # Use CK mha_batch_prefill for prefill (query_length > 4)
         k_cache, v_cache = self._reshape_kv_cache_vectorized(kv_cache.kv_cache_base)
         block_table = fmha_params.kv_cache_block_id_device
         cu_seqlens_q = fmha_params.cu_seqlens_q.to(q_tensor.device)
@@ -279,8 +308,75 @@ class AiterPrefillAttnOp:
         seqlen_k = (prefix_lengths_device + input_lengths).to(torch.int32)
 
         softmax_scale = 1.0 / math.sqrt(self.head_dim)
-        kv_indptr = cu_seqlens_q
-        kv_page_indices = torch.empty(0, dtype=torch.int32, device=q_tensor.device)
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=q_tensor.device)
+        kv_page_indices = torch.zeros(1, dtype=torch.int32, device=q_tensor.device)
+
+        logging.warning(
+            f"[DEBUG mha_batch_prefill] q_tensor.shape={q_tensor.shape} dtype={q_tensor.dtype}, "
+            f"k_cache.shape={k_cache.shape} dtype={k_cache.dtype}, "
+            f"v_cache.shape={v_cache.shape} dtype={v_cache.dtype}, "
+            f"block_table.shape={block_table.shape if block_table is not None else None}, "
+            f"cu_seqlens_q={cu_seqlens_q}, kv_indptr={kv_indptr}, "
+            f"kv_page_indices={kv_page_indices}, "
+            f"head_num={self.head_num}, head_num_kv={self.head_num_kv}, "
+            f"head_dim={self.head_dim}, tokens_per_block={self.tokens_per_block}"
+        )
+
+        res = aiter.mha_batch_prefill_func(
+            q_tensor,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_page_indices,
+            fmha_params.max_seqlen_q,
+            fmha_params.max_seqlen_k,
+            causal=True,
+            block_table=block_table.to(dtype=torch.int32, device=q_tensor.device),
+            seqlen_k=seqlen_k,
+        )
+        return res.reshape(fmha_params.token_q_num, self.head_num * self.head_dim)
+
+        # prefix_lengths: default to zeros when no prefix (unified logic)
+        batch_size = cu_seqlens_q.shape[0] - 1
+        if (
+            fmha_params.prefix_lengths is not None
+            and fmha_params.prefix_lengths.numel() > 0
+        ):
+            prefix_lengths_device = fmha_params.prefix_lengths.to(q_tensor.device)
+        else:
+            prefix_lengths_device = torch.zeros(
+                batch_size, dtype=torch.int32, device=q_tensor.device
+            )
+
+        input_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        seqlen_k = (prefix_lengths_device + input_lengths).to(torch.int32)
+
+        softmax_scale = 1.0 / math.sqrt(self.head_dim)
+
+        # For paged attention, kv_indptr should be cumulative page counts, not token counts
+        # Each sequence uses ceil(seqlen / page_size) pages
+        page_size = self.tokens_per_block
+        kv_indptr = torch.zeros_like(cu_seqlens_q)
+        kv_indptr[1:] = ((cu_seqlens_q[1:] - cu_seqlens_q[:-1]) + page_size - 1) // page_size
+        kv_indptr = torch.cumsum(kv_indptr, dim=0).to(torch.int32)
+        kv_indptr[0] = 0
+        # Use actual page indices from block_table
+        num_pages = kv_indptr[-1].item()
+        if num_pages > 0:
+            kv_page_indices = block_table[:, :num_pages].contiguous().view(-1).to(torch.int32)
+        else:
+            kv_page_indices = torch.empty(0, dtype=torch.int32, device=q_tensor.device)
+
+        logging.warning(
+            f"[DEBUG mha_batch_prefill] q_tensor.shape={q_tensor.shape} dtype={q_tensor.dtype}, "
+            f"k_cache.shape={k_cache.shape} dtype={k_cache.dtype}, "
+            f"v_cache.shape={v_cache.shape} dtype={v_cache.dtype}, "
+            f"block_table.shape={block_table.shape if block_table is not None else None}, "
+            f"cu_seqlens_q={cu_seqlens_q}, kv_indptr={kv_indptr}, "
+            f"head_num={self.head_num}, head_num_kv={self.head_num_kv}, "
+            f"head_dim={self.head_dim}, tokens_per_block={self.tokens_per_block}"
+        )
 
         res = aiter.mha_batch_prefill_func(
             q_tensor,
@@ -295,8 +391,9 @@ class AiterPrefillAttnOp:
             softmax_scale=softmax_scale,
             causal=self.is_causal,
             window_size=(-1, 0),
-            block_table=block_table,
+            block_table=None,
             seqlen_k=seqlen_k,
+            kv_last_page_lens=seqlen_k,
         )
         return res.reshape(fmha_params.token_q_num, self.head_num * self.head_dim)
 
