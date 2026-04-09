@@ -53,14 +53,17 @@ def auto_configure_deepep(
     - PD separation + Decode node + Multi-node multi-GPU (>=9 GPUs): 1, 1, 1
     """
 
-    # in cp mode, do not use all gather, tp_size set to 1
+    # Use all_gather only in pure TP mode (ep_size == 1).
+    # When ep_size > 1, use DeepEP for expert parallel dispatch regardless
+    # of whether ep_size equals tp_size (e.g. 4tp4ep, 8tp8ep).
+    # In CP mode, do not use all gather, tp_size set to 1
     tp_size = parallelism_config.get_attn_tp_size()
     ep_size = parallelism_config.ep_size
     moe_config.ll_num_max_token = ll_num_max_token
     moe_config.use_all_gather = (
         moe_config.use_all_gather
         and not deep_ep_config.use_deepep_low_latency
-        and (ep_size == tp_size or ep_size == 1)
+        and ep_size == 1
     )
     if moe_config.use_all_gather:
         moe_config.use_deepep_moe = False
@@ -213,19 +216,22 @@ def set_parallelism_config(
     # 2. Pure TP:    ep_size explicitly set to 1, tp_size > 1, dp_size == 1
     # 3. EP mode:    ep_size == 0 (default), ep_size auto-derived as tp_size * dp_size
     if parallelism_config.ep_size == 1:
-        assert parallelism_config.tp_size >= 1, (
-            f"Pure TP mode (ep_size=1) requires tp_size >= 1, got tp_size={parallelism_config.tp_size}"
-        )
-        assert parallelism_config.dp_size == 1, (
-            f"Pure TP mode (ep_size=1) requires dp_size == 1, got dp_size={parallelism_config.dp_size}"
-        )
+        assert (
+            parallelism_config.tp_size >= 1
+        ), f"Pure TP mode (ep_size=1) requires tp_size >= 1, got tp_size={parallelism_config.tp_size}"
+        assert (
+            parallelism_config.dp_size == 1
+        ), f"Pure TP mode (ep_size=1) requires dp_size == 1, got dp_size={parallelism_config.dp_size}"
     elif parallelism_config.ep_size == 0:
         logging.info("parallelism_config.ep_size == 0, auto set to world size")
-        parallelism_config.ep_size = parallelism_config.tp_size * parallelism_config.dp_size
-    else:
-        assert parallelism_config.ep_size == parallelism_config.tp_size * parallelism_config.dp_size, (
-            f"ep_size must be equal to 1 or tp_size * dp_size, got ep_size={parallelism_config.ep_size}, tp_size={parallelism_config.tp_size}, dp_size={parallelism_config.dp_size}"
+        parallelism_config.ep_size = (
+            parallelism_config.tp_size * parallelism_config.dp_size
         )
+    else:
+        assert (
+            parallelism_config.ep_size
+            == parallelism_config.tp_size * parallelism_config.dp_size
+        ), f"ep_size must be equal to 1 or tp_size * dp_size, got ep_size={parallelism_config.ep_size}, tp_size={parallelism_config.tp_size}, dp_size={parallelism_config.dp_size}"
 
     ffn_tp_size = parallelism_config.tp_size // parallelism_config.ffn_sp_size
     parallelism_config.ffn_tp_size = ffn_tp_size
