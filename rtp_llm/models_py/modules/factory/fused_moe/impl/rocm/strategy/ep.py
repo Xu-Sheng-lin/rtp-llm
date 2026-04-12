@@ -17,7 +17,16 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.strategy_base import MoeSt
 
 
 class RocmEpNormalStrategy(MoeStrategy):
-    """ROCm EP normal mode strategy"""
+    """ROCm EP normal mode strategy (requires DeepEP)."""
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        """Only applicable when DeepEP is available."""
+        try:
+            import deep_ep  # noqa: F401
+        except ImportError:
+            checker.check(False)
+            return
 
     def get_attributes(self) -> StrategyAttributes:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.rocm.executors.deepep_normal_fused_moe_executor import (
