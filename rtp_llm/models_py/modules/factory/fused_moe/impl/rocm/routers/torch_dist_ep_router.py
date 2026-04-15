@@ -312,13 +312,20 @@ class TorchDistEpRouter(FusedMoeDataRouter):
             "hidden_dim": a1.shape[-1],
         }
 
+        # Compute per-expert token counts from received local expert IDs
+        expert_num_tokens_cpu = [0] * self.expert_num_per_rank
+        if recv_h.shape[0] > 0:
+            lids_cpu = recv_lids.cpu().tolist()
+            for lid in lids_cpu:
+                expert_num_tokens_cpu[lid] += 1
+
         return ExpertForwardPayload(
             expert_x=recv_h,
             expert_x_origin_dtype=a1.dtype,
             expert_x_scale=None,
             expert_tokens_meta=ExpertTokensMetadata(
                 expert_num_tokens=None,
-                expert_num_tokens_cpu=[int(recv_h.shape[0])] * self.expert_num_per_rank,
+                expert_num_tokens_cpu=expert_num_tokens_cpu,
             ),
             expert_topk_ids=recv_lids.reshape(-1, 1),
             expert_topk_weights=recv_w.reshape(-1, 1),

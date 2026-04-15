@@ -171,13 +171,14 @@ class FusedMoeExecutor(FusedMoeExpertExecutor):
         # In EP mode (ep_size > 1), the router handles weighting in _combine,
         # so skip kernel-side weighting. In non-EP mode, the kernel must
         # apply router weights since there's no external combiner.
+        # Per aiter convention, ck_moe_stage1 never applies weighting —
+        # only ck_moe_stage2 does.
         routed_weights = sorted_weights if self.ep_size <= 1 else None
 
         # === Stage 1: Up/Gate Projection + Activation ===
         a2 = torch.empty((M, topk, inter_dim // 2), dtype=dtype, device=device)
         fc1_scale = None
         a1_scale = None
-        # act_op = 1 if activation == "silu" else 0  # 1 = silu_and_mul
 
         aiter.ck_moe_stage1(
             hidden_states=a1,
@@ -192,7 +193,6 @@ class FusedMoeExecutor(FusedMoeExpertExecutor):
             w1_scale=fc1_scale,
             a1_scale=a1_scale,
             block_m=block_size,
-            sorted_weights=routed_weights,
         )
 
         # Reshape for stage2: [M, topk, inter_dim//2] -> [M*topk, inter_dim//2]
