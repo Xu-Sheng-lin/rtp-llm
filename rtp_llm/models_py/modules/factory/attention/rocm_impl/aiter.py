@@ -1,5 +1,7 @@
+import hashlib
 import logging
 import math
+import os
 from typing import Any, List, Optional
 
 import aiter
@@ -21,6 +23,39 @@ from rtp_llm.ops.compute_ops import (
     PyAttentionInputs,
     paged_attention_atrex,
 )
+
+_DEBUG_ATTN_HASH = os.environ.get("RTP_DEBUG_ATTN_HASH", "0") == "1"
+_DEBUG_ATTN_CALL_COUNT = 0
+
+
+def _hash_tensor_slices(t: torch.Tensor, cu_seqlens: torch.Tensor) -> List[str]:
+    bs = cu_seqlens.shape[0] - 1
+    cu = cu_seqlens.detach().to("cpu", non_blocking=False).tolist()
+    t_cpu = t.detach().contiguous().to("cpu", non_blocking=False)
+    if t_cpu.dtype in (torch.bfloat16, torch.float16):
+        t_cpu = t_cpu.view(torch.int16)
+    out = []
+    for i in range(bs):
+        chunk = t_cpu[cu[i] : cu[i + 1]].contiguous()
+        h = hashlib.md5(chunk.numpy().tobytes()).hexdigest()[:10]
+        out.append(h)
+    return out
+
+
+def _maybe_dump_attn(
+    prefix: str, q: torch.Tensor, res: torch.Tensor, cu_seqlens_q: torch.Tensor
+) -> None:
+    if not _DEBUG_ATTN_HASH:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    global _DEBUG_ATTN_CALL_COUNT
+    _DEBUG_ATTN_CALL_COUNT += 1
+    cnt = _DEBUG_ATTN_CALL_COUNT
+    bs = cu_seqlens_q.shape[0] - 1
+    q_h = _hash_tensor_slices(q, cu_seqlens_q)
+    o_h = _hash_tensor_slices(res, cu_seqlens_q)
+    print(f"[ATTN_HASH] {prefix} call={cnt} bs={bs} q={q_h} out={o_h}", flush=True)
 
 
 # Pure Python implementation of FMHAParams
@@ -322,6 +357,7 @@ class AiterPrefillAttnOp:
             block_table=block_table,
             seqlen_k=seqlen_k,
         )
+        _maybe_dump_attn("unified", q_tensor, res, cu_seqlens_q)
         return res.reshape(fmha_params.token_q_num, self.head_num * self.head_dim)
 
 
@@ -404,6 +440,7 @@ class AiterPrefillAttnOpPaged:
             k_descale=k_descale,
             v_descale=v_descale,
         )
+        _maybe_dump_attn("paged", q_tensor, res, cu_seqlens_q)
 
         token_num = fmha_params.token_q_num
         return res.reshape(token_num, self.head_num * self.head_dim)

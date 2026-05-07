@@ -44,7 +44,7 @@ def cal_block_idx(x, seq_size_per_block):
     configs=_get_autotune_configs(),
     key=["K", "V"],
 )
-@triton.jit(do_not_specialize=["N", "T"])
+@triton.jit
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
     a,

@@ -1,9 +1,216 @@
 import logging
+import os
 import sys
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+
+_DEBUG_PRECISION = os.environ.get("RTP_DEBUG_PRECISION", "0") == "1"
+_PREC_REF: Dict[str, torch.Tensor] = {}
+_PREC_MAX_LAYERS = int(os.environ.get("RTP_DEBUG_PRECISION_LAYERS", "5"))
+_DECODE_STEP = 0
+_DECODE_MAX_STEPS = int(os.environ.get("RTP_DEBUG_DECODE_STEPS", "5"))
+_USE_TORCH_FLA_DECODE = os.environ.get("RTP_FLA_DECODE_TORCH", "0") == "1"
+
+if os.environ.get("RTP_FORCE_DETERMINISTIC", "0") == "1":
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    print(
+        f"[FORCE_DETERMINISTIC] torch.use_deterministic_algorithms(True, warn_only=True) called",
+        flush=True,
+    )
+
+
+def _probe(tag: str, t: torch.Tensor, cu_seqlens: torch.Tensor) -> None:
+    if not _DEBUG_PRECISION:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    bs = cu_seqlens.shape[0] - 1
+    cu = cu_seqlens.detach().to("cpu", non_blocking=False).tolist()
+    t_cpu = t.detach().float().to("cpu", non_blocking=False)
+    if bs == 1:
+        _PREC_REF[tag] = t_cpu[cu[0] : cu[1]].clone()
+        print(
+            f"[PREC] {tag} bs=1 REF saved shape={list(_PREC_REF[tag].shape)}",
+            flush=True,
+        )
+        return
+    ref = _PREC_REF.get(tag)
+    if ref is None:
+        return
+    for i in range(bs):
+        slot = t_cpu[cu[i] : cu[i + 1]]
+        if slot.shape != ref.shape:
+            print(
+                f"[PREC] {tag} slot={i}/{bs} SHAPE_MISMATCH ref={list(ref.shape)} slot={list(slot.shape)}",
+                flush=True,
+            )
+            continue
+        diff = (slot - ref).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        cos = F.cosine_similarity(slot.reshape(1, -1), ref.reshape(1, -1)).item()
+        print(
+            f"[PREC] {tag} slot={i}/{bs} max_abs={max_diff:.4e} mean_abs={mean_diff:.4e} cos={cos:.8f}",
+            flush=True,
+        )
+
+
+def _probe_decode(tag: str, t: torch.Tensor) -> None:
+    if not _DEBUG_PRECISION:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    bs = t.shape[0]
+    t_flat = t.detach().float().reshape(bs, -1).to("cpu", non_blocking=False)
+    if bs == 1:
+        _PREC_REF[tag] = t_flat[0].clone()
+        print(f"[PREC_D] {tag} bs=1 REF saved shape={list(t.shape)}", flush=True)
+        return
+    ref = _PREC_REF.get(tag)
+    if ref is None:
+        return
+    for i in range(bs):
+        slot = t_flat[i]
+        if slot.shape != ref.shape:
+            print(
+                f"[PREC_D] {tag} slot={i}/{bs} SHAPE_MISMATCH ref={list(ref.shape)} slot={list(slot.shape)}",
+                flush=True,
+            )
+            continue
+        diff = (slot - ref).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        cos = F.cosine_similarity(slot.unsqueeze(0), ref.unsqueeze(0)).item()
+        print(
+            f"[PREC_D] {tag} slot={i}/{bs} max_abs={max_diff:.4e} mean_abs={mean_diff:.4e} cos={cos:.8f}",
+            flush=True,
+        )
+
+
+def _probe_ssm_state(
+    tag: str,
+    ssm_states: torch.Tensor,
+    attn_inputs: "PyAttentionInputs",
+    seq_size_per_block: int,
+) -> None:
+    if not _DEBUG_PRECISION:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    block_map = attn_inputs.kv_cache_kernel_block_id_device
+    seq_lens = attn_inputs.sequence_lengths_plus_1_d
+    if block_map is None or seq_lens is None:
+        return
+    bs = seq_lens.shape[0]
+    seq_lens_cpu = seq_lens.detach().to("cpu", non_blocking=False).tolist()
+    block_map_cpu = block_map.detach().to("cpu", non_blocking=False)
+    states = []
+    for i in range(bs):
+        block_offset = (int(seq_lens_cpu[i]) - 2) // seq_size_per_block
+        block_id = int(block_map_cpu[i, block_offset].item())
+        if block_id <= 0:
+            print(
+                f"[PREC_SSM] {tag} slot={i}/{bs} INVALID_BLOCK block_id={block_id}",
+                flush=True,
+            )
+            continue
+        state_i = (
+            ssm_states[block_id]
+            .detach()
+            .float()
+            .reshape(-1)
+            .to("cpu", non_blocking=False)
+        )
+        states.append(state_i)
+    if not states:
+        return
+    if bs == 1:
+        _PREC_REF[tag] = states[0].clone()
+        print(
+            f"[PREC_SSM] {tag} bs=1 REF saved shape={list(ssm_states[0].shape)}",
+            flush=True,
+        )
+        return
+    ref = _PREC_REF.get(tag)
+    if ref is None:
+        return
+    for i, state_i in enumerate(states):
+        if state_i.shape != ref.shape:
+            print(f"[PREC_SSM] {tag} slot={i}/{bs} SHAPE_MISMATCH", flush=True)
+            continue
+        diff = (state_i - ref).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        cos = F.cosine_similarity(state_i.unsqueeze(0), ref.unsqueeze(0)).item()
+        print(
+            f"[PREC_SSM] {tag} slot={i}/{bs} max_abs={max_diff:.4e} mean_abs={mean_diff:.4e} cos={cos:.8f}",
+            flush=True,
+        )
+
+
+def _torch_fla_decode_recurrence(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    scale: Optional[float],
+    ssm_states: torch.Tensor,
+    block_map: torch.Tensor,
+    seq_size_per_block: int,
+    sequence_lengths: torch.Tensor,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+) -> torch.Tensor:
+    N, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[3]
+    assert T == 1
+    if scale is None:
+        scale = K**-0.5
+
+    read_offsets = (sequence_lengths - 2) // seq_size_per_block
+    write_offsets = (sequence_lengths - 1) // seq_size_per_block
+    n_idx = torch.arange(N, device=block_map.device)
+    read_bids = block_map[n_idx, read_offsets.long()].long()
+    write_bids = block_map[n_idx, write_offsets.long()].long()
+
+    h = ssm_states[read_bids].float()
+
+    q_f = q[:, 0].float()
+    k_f = k[:, 0].float()
+    v_f = v[:, 0].float()
+    a_f = a.reshape(N, HV).float()
+    b_f = b.reshape(N, HV).float()
+
+    kv_ratio = HV // H
+    q_exp = q_f.repeat_interleave(kv_ratio, dim=1)
+    k_exp = k_f.repeat_interleave(kv_ratio, dim=1)
+
+    q_exp = q_exp / (q_exp.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
+    k_exp = k_exp / (k_exp.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
+    q_exp = q_exp * scale
+
+    g = -A_log.float().exp().unsqueeze(0) * F.softplus(
+        a_f + dt_bias.float().unsqueeze(0),
+        beta=softplus_beta,
+        threshold=softplus_threshold,
+    )
+    beta_val = b_f.sigmoid()
+
+    h = h * g.unsqueeze(-1).unsqueeze(-1).exp()
+    delta = (h * k_exp.unsqueeze(-1)).sum(2)
+    v_mod = (v_f - delta) * beta_val.unsqueeze(-1)
+    h = h + k_exp.unsqueeze(-1) * v_mod.unsqueeze(2)
+    o = (h * q_exp.unsqueeze(-1)).sum(2)
+
+    ssm_states[write_bids] = h.to(ssm_states.dtype)
+    return o.unsqueeze(1).to(q.dtype)
+
 
 import rtp_llm.ops.compute_ops as compute_ops
 from rtp_llm.config.model_config import ModelConfig
@@ -368,24 +575,51 @@ class Qwen3NextGatedDeltaNetDecode(Qwen3NextGatedDeltaNetBase):
         )
 
         ssm_states = self._get_ssm_states(kv_cache_tensor)
-        core_attn_out, _ = fused_sigmoid_gating_delta_rule_update(
-            A_log=self.alog,
-            a=a,
-            dt_bias=self.dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            b=b,
-            scale=None,
-            initial_state=ssm_states,
-            inplace_final_state=True,
-            block_map=attn_inputs.kv_cache_kernel_block_id_device,
-            seq_size_per_block=seq_size_per_block,
-            sequence_lengths=attn_inputs.sequence_lengths_plus_1_d,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
+        if (
+            _DEBUG_PRECISION
+            and not attn_inputs.is_prefill
+            and _DECODE_STEP <= _DECODE_MAX_STEPS
+        ):
+            _probe_ssm_state(
+                f"D{_DECODE_STEP}_L{self._layer_idx}_ssm_state",
+                ssm_states,
+                attn_inputs,
+                seq_size_per_block,
+            )
+        if _USE_TORCH_FLA_DECODE and seq == 1:
+            core_attn_out = _torch_fla_decode_recurrence(
+                A_log=self.alog,
+                a=a,
+                dt_bias=self.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                b=b,
+                scale=None,
+                ssm_states=ssm_states,
+                block_map=attn_inputs.kv_cache_kernel_block_id_device,
+                seq_size_per_block=seq_size_per_block,
+                sequence_lengths=attn_inputs.sequence_lengths_plus_1_d,
+            )
+        else:
+            core_attn_out, _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.alog,
+                a=a,
+                dt_bias=self.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                b=b,
+                scale=None,
+                initial_state=ssm_states,
+                inplace_final_state=True,
+                block_map=attn_inputs.kv_cache_kernel_block_id_device,
+                seq_size_per_block=seq_size_per_block,
+                sequence_lengths=attn_inputs.sequence_lengths_plus_1_d,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
         res = core_attn_out.reshape(
             [-1, core_attn_out.shape[2], core_attn_out.shape[3]]
         )
@@ -415,6 +649,12 @@ class Qwen3NextGatedDeltaNetDecode(Qwen3NextGatedDeltaNetBase):
             attn_inputs,
             is_target_verify,
         )
+        if (
+            _DEBUG_PRECISION
+            and not attn_inputs.is_prefill
+            and _DECODE_STEP <= _DECODE_MAX_STEPS
+        ):
+            _probe_decode(f"D{_DECODE_STEP}_L{self._layer_idx}_post_conv1d", mixed_qkv)
         attn_out = self._fla(
             mixed_qkv,
             b,
@@ -524,6 +764,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.out_proj = LinearFactory.create_linear_from_weights(
             weights, W.linear_attn_out_w, W.linear_attn_out_s, None, quant_config
         )
+        self._layer_idx = -1
 
     # mixed_qkvz, mixed_ba -> q, k, v, z, b, a
     def fix_query_key_value_ordering(
@@ -563,8 +804,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             or not attention_inputs.is_prefill
             or attn_meta.get_prefill_conv1d_meta() is not None
         ), "prefill_conv1d_meta is required for prefill"
+        li = self._layer_idx
+        is_pf = attention_inputs.is_prefill
+        do_probe_pf = is_pf and li < _PREC_MAX_LAYERS
+        do_probe_dec = (not is_pf) and _DECODE_STEP <= _DECODE_MAX_STEPS
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+        if do_probe_pf:
+            _probe(
+                f"L{li}_in_proj_qkvz",
+                projected_states_qkvz,
+                attention_inputs.cu_seqlens,
+            )
+        elif do_probe_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_in_proj_qkvz", projected_states_qkvz)
         projected_states_ba = self.in_proj_ba(hidden_states)
+        if do_probe_pf:
+            _probe(
+                f"L{li}_in_proj_ba", projected_states_ba, attention_inputs.cu_seqlens
+            )
+        elif do_probe_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_in_proj_ba", projected_states_ba)
         mixed_qkv, z, b, a = self.fix_query_key_value_ordering(
             projected_states_qkvz, projected_states_ba
         )
@@ -576,12 +835,24 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             attn_output = self.decode_gdn(
                 mixed_qkv, b, a, attention_inputs, kv_cache, attn_meta
             )
+        if do_probe_pf:
+            _probe(f"L{li}_post_gdn", attn_output, attention_inputs.cu_seqlens)
+        elif do_probe_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_post_gdn", attn_output)
         attn_output = self.norm(
             attn_output.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
         )
         # from [token * head, dim] -> [token, head * dim]
         attn_output = attn_output.reshape(-1, self.local_num_v_heads * self.head_v_dim)
+        if do_probe_pf:
+            _probe(f"L{li}_post_norm", attn_output, attention_inputs.cu_seqlens)
+        elif do_probe_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_post_norm", attn_output)
         attn_output = self.out_proj(attn_output)
+        if do_probe_pf:
+            _probe(f"L{li}_post_out_proj", attn_output, attention_inputs.cu_seqlens)
+        elif do_probe_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_post_out_proj", attn_output)
         if self.parallelism_config.get_attn_tp_size() > 1:
             attn_output = all_reduce(attn_output, group=Group.TP)
         return attn_output
@@ -611,6 +882,8 @@ class Qwen3NextDecoderLayer(nn.Module):
                 config.layernorm_eps,
                 config.quant_config,
             )
+            self.self_attn._layer_idx = layer_idx
+            self.self_attn.decode_gdn._layer_idx = layer_idx
         else:
             attn_configs = config.getAttentionConfigs(
                 parallelism_config.get_attn_tp_size()
@@ -653,7 +926,15 @@ class Qwen3NextDecoderLayer(nn.Module):
         attention_inputs: Optional[PyAttentionInputs] = None,
         attn_meta: Qwen3NextMetadata = Qwen3NextMetadata(),
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        li = self.layer_idx
+        is_pf = attention_inputs is not None and attention_inputs.is_prefill
+        do_pf = is_pf and li < _PREC_MAX_LAYERS
+        do_dec = (not is_pf) and _DECODE_STEP <= _DECODE_MAX_STEPS
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if do_pf:
+            _probe(f"L{li}_post_input_ln", hidden_states, attention_inputs.cu_seqlens)
+        elif do_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_post_input_ln", hidden_states)
 
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -662,10 +943,22 @@ class Qwen3NextDecoderLayer(nn.Module):
             attention_inputs=attention_inputs,
             attn_meta=attn_meta,
         )
+        if do_pf:
+            _probe(f"L{li}_post_attn", hidden_states, attention_inputs.cu_seqlens)
+        elif do_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_post_attn", hidden_states)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if do_pf:
+            _probe(f"L{li}_post_attn_ln", hidden_states, attention_inputs.cu_seqlens)
+        elif do_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_post_attn_ln", hidden_states)
 
         hidden_states = self.mlp(hidden_states)
+        if do_pf:
+            _probe(f"L{li}_post_mlp", hidden_states, attention_inputs.cu_seqlens)
+        elif do_dec:
+            _probe_decode(f"D{_DECODE_STEP}_L{li}_post_mlp", hidden_states)
 
         return hidden_states, residual
 
@@ -719,6 +1012,7 @@ class Qwen3NextModel(GptModelBase):
         )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
+        global _DECODE_STEP
         input_ids: torch.Tensor = inputs.input_ids
         inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds
@@ -740,6 +1034,17 @@ class Qwen3NextModel(GptModelBase):
 
         residual = torch.zeros_like(hidden_states)
 
+        if attention_inputs.is_prefill:
+            _DECODE_STEP = 0
+            _probe("emb", hidden_states, attention_inputs.cu_seqlens)
+        else:
+            _DECODE_STEP += 1
+            if _DEBUG_PRECISION:
+                print(
+                    f"[DECODE_ENTER] step={_DECODE_STEP} bs={hidden_states.shape[0]} capturing={torch.cuda.is_current_stream_capturing()}",
+                    flush=True,
+                )
+
         for i, decoder_layer in enumerate(self.layers):
             select_block_map_for_layer(attention_inputs, i)
             hidden_states, residual = decoder_layer(
@@ -750,6 +1055,15 @@ class Qwen3NextModel(GptModelBase):
                 attention_inputs=attention_inputs,
                 attn_meta=attn_meta,
             )
+            if attention_inputs.is_prefill and i < _PREC_MAX_LAYERS:
+                layer_type = (
+                    "lin"
+                    if self.layers[i].layer_type == HybridAttentionType.LINEAR
+                    else "full"
+                )
+                _probe(
+                    f"L{i}_{layer_type}_out", hidden_states, attention_inputs.cu_seqlens
+                )
 
         hidden_states, residual = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
