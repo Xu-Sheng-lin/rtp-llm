@@ -1,8 +1,22 @@
-"""Aiter CustomAllreduce wrapper for ROCm prefill AllReduce.
+"""Aiter CustomAllreduce wrapper for ROCm AllReduce.
 
-Uses aiter low-level ops (``init_custom_ar``, ``all_reduce``, etc.)
-directly, exchanging IPC handles via the NCCL group (same approach as
-the C++ ``CustomAllReduceComm``).
+Uses ``aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce``
+(the upstream vLLM-style wrapper) under the hood. Key benefit over a
+low-level-ops wrapper:
+
+- ``CustomAllreduce`` records input/output addresses to an internal
+  unregistered queue during HIPGraph capture and batch-registers their
+  IPC handles via ``register_graph_buffers`` after capture exits. The
+  kernel then accesses peer pointers through a C++-maintained slot table
+  (indirection), which is robust against PyTorch caching allocator reuse
+  — the same scenario that triggered the ``trt-allreduce-stale-ipc-cache``
+  BUGFIX (BF16 → Inf → NaN at TP4 / 200+ requests with fast path).
+
+API kept compatible with ``rocm_rccl.py`` callers (``aiter_ar_manager``
+singleton with ``ensure_initialized`` / ``should_use`` / ``allreduce``
+/ ``close``). Capture-flow helpers (``enter_capture`` / ``exit_capture``
+/ ``has_pending_capture`` / ``consume_capture``) are added so the dispatch
+in ``hipgraph_capture_all_reduce`` can include aiter as a graph-safe tier.
 """
 
 from __future__ import annotations
@@ -18,233 +32,243 @@ from torch.distributed import ProcessGroup
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_SIZE = 128 * 1024 * 1024  # 128 MB
+_SUPPORTED_WORLD_SIZES = {2, 4, 8}
 
-# Aiter custom AR kernel only handles BF16 and FP8 (e4m3fn / e4m3fnuz).
-# FP16/FP32 must fall through to the next tier; otherwise the BF16-typed
-# kernel reads them as garbage and produces wrong values.
+# Aiter CustomAllreduce supports bf16 and fp16 (no fp8 in graph path).
 _SUPPORTED_DTYPES = (
     torch.bfloat16,
-    torch.float8_e4m3fn,
-    torch.float8_e4m3fnuz,
+    torch.float16,
 )
 
+
 class _AiterARManager:
-    """Singleton that manages aiter custom AllReduce via low-level ops."""
+    """Singleton managing ``aiter.CustomAllreduce`` lifecycle.
+
+    The underlying ``CustomAllreduce`` instance is created lazily on the
+    first ``ensure_initialized`` call, after the TP process group is known.
+    A gloo (non-NCCL) backend group is created internally for the IPC
+    handshake (broadcast_object_list on CPU tensors).
+    """
 
     def __init__(self) -> None:
         self.group: Optional[ProcessGroup] = None
+        self.gloo_group: Optional[ProcessGroup] = None
         self.device_id: Optional[int] = None
         self.rank: int = 0
         self.world_size: int = 1
-        self.fa: int = 0
-        self.buffer: Optional[Tensor] = None
+        self.ar = None  # CustomAllreduce instance
         self.max_size: int = _DEFAULT_MAX_SIZE
         self.initialized = False
         self.disabled = False
-
-    def _exchange_ipc_handles(self, local_buffer: Tensor):
-        """Exchange IPC handles via NCCL all_gather.
-
-        Same approach as C++ CustomAllReduceComm::prepareP2PBuffer_:
-        copy the local IPC handle to GPU, NCCL all_gather, then copy back.
-        """
-        import aiter as ops
-
-        handle_tensor = ops.get_meta_buffer_ipc_handle(local_buffer)
-        handle_size = handle_tensor.numel()
-
-        device = f"cuda:{self.device_id}"
-        local_gpu = torch.empty(handle_size, dtype=torch.uint8, device=device)
-        gathered_gpu = torch.empty(
-            handle_size * self.world_size, dtype=torch.uint8, device=device
-        )
-
-        local_gpu.copy_(handle_tensor)
-        dist.all_gather_into_tensor(gathered_gpu, local_gpu, group=self.group)
-        # Sync only the current stream — full device sync would block
-        # unrelated streams (e.g. another process group's collectives).
-        torch.cuda.current_stream().synchronize()
-
-        gathered_cpu = gathered_gpu.cpu()
-        handles = []
-        offsets = []
-        for i in range(self.world_size):
-            start = i * handle_size
-            end = start + handle_size
-            handles.append(gathered_cpu[start:end].clone())
-            offsets.append(0)
-        return handles, offsets
+        self._is_capture_active = False
 
     def initialize(self, group: ProcessGroup, device_id: int) -> None:
-        if self.initialized and group == self.group and device_id == self.device_id:
-            return
-        # If this is a re-init (different group/device), free the previous
-        # custom-AR handle and IPC buffer first to avoid leaking
-        # hipDeviceMallocUncached memory across re-inits.
-        if self.fa != 0:
-            try:
-                import aiter as ops
-
-                ops.dispose(self.fa)
-            except Exception as exc:
-                logger.warning("Aiter CustomAR dispose on re-init failed: %s", exc)
-            self.fa = 0
-        self.buffer = None
-        self._meta = None
-        self._rank_data = None
-        self.initialized = False
-        self.disabled = False
-        self.group = group
-        self.device_id = device_id
-
-        # Phase 0: every rank locally allocates the meta + buffer.
-        # We must reach a consensus that ALL ranks succeeded BEFORE issuing
-        # any collective (otherwise a peer's allocate_meta_buffer OOM would
-        # deadlock the survivors at all_gather_into_tensor).
-        local_ok = False
-        local_err: Optional[str] = None
-        meta = None
-        rank_data = None
-        buffer = None
-        try:
-            import aiter as ops
-
-            self.rank = dist.get_rank(group=group)
-            self.world_size = dist.get_world_size(group=group)
-
-            if self.world_size == 1 or self.world_size not in {2, 4, 6, 8}:
-                local_err = f"unsupported world_size={self.world_size}"
-            else:
-                torch.cuda.set_device(device_id)
-                meta = ops.allocate_meta_buffer(ops.meta_size() + self.max_size * 2)
-                rank_data = torch.empty(
-                    8 * 1024 * 1024,
-                    dtype=torch.uint8,
-                    device=f"cuda:{device_id}",
-                )
-                # Must use allocate_meta_buffer (hipDeviceMallocUncached)
-                # instead of torch.empty. On some ROCm platforms hipMalloc
-                # memory does not support IPC (hipIpcOpenMemHandle returns
-                # error 17).
-                buffer = ops.allocate_meta_buffer(self.max_size)
-                local_ok = True
-        except ImportError:
-            local_err = "aiter not available"
-        except Exception as exc:
-            local_err = f"local allocation failed: {exc}"
-
-        # Phase 1 consensus
-        try:
-            world_size = dist.get_world_size(group=group)
-            ok_flags = [None] * world_size
-            dist.all_gather_object(ok_flags, local_ok, group=group)
-        except Exception as exc:
-            logger.warning("Aiter CustomAR init consensus failed: %s", exc)
-            ok_flags = [False] * (self.world_size or 1)
-            local_ok = False
-
-        if not all(bool(x) for x in ok_flags):
-            if local_err:
-                logger.info("Aiter CustomAllreduce disabled: %s", local_err)
-            else:
-                logger.info(
-                    "Aiter CustomAllreduce disabled: a peer rank failed init",
-                )
-            # Drop locally allocated resources (Python GC frees them).
-            self.disabled = True
-            self.initialized = True
+        if self.initialized and self.group is group and self.device_id == device_id:
             return
 
-        # Phase 2: all ranks have meta+buffer — do the IPC exchanges.
-        try:
-            import aiter as ops
-
-            meta_handles, meta_offsets = self._exchange_ipc_handles(meta)
-            self.fa = ops.init_custom_ar(
-                meta, rank_data, meta_handles, meta_offsets, self.rank, True,
+        world_size = dist.get_world_size(group=group)
+        if world_size not in _SUPPORTED_WORLD_SIZES:
+            logger.warning(
+                "aiter CustomAllreduce: unsupported world_size=%d (supported: %s)",
+                world_size,
+                sorted(_SUPPORTED_WORLD_SIZES),
             )
-            buf_handles, buf_offsets = self._exchange_ipc_handles(buffer)
-            ops.register_buffer(self.fa, buffer, buf_handles, buf_offsets)
-            self.buffer = buffer
-            self._meta = meta
-            self._rank_data = rank_data
-            dist.barrier(group=group)
-            self.initialized = True
-        except Exception as exc:
-            logger.warning("Aiter CustomAR phase-2 IPC exchange failed: %s", exc)
-            if self.fa != 0:
-                try:
-                    ops.dispose(self.fa)
-                except Exception:
-                    pass
-                self.fa = 0
             self.disabled = True
             self.initialized = True
+            return
 
-    def close(self) -> None:
-        """Release the custom-AR handle and IPC buffer.
+        try:
+            from aiter.dist.device_communicators.custom_all_reduce import (
+                CustomAllreduce,
+            )
+        except Exception as exc:
+            logger.warning("aiter CustomAllreduce: import failed: %s", exc)
+            self.disabled = True
+            self.initialized = True
+            return
 
-        Safe to call multiple times. Call from teardown paths
-        (e.g. destroy_distributed_environment) so IPC buffers don't leak
-        across process-group re-creation cycles.
-        """
-        if self.fa != 0:
-            try:
-                import aiter as ops
+        # CustomAllreduce asserts the bound group is non-NCCL backend
+        # (uses TCP store + CPU broadcast for IPC handshake).
+        try:
+            gloo_group = dist.new_group(backend="gloo")
+        except Exception as exc:
+            logger.warning(
+                "aiter CustomAllreduce: gloo group creation failed: %s",
+                exc,
+            )
+            self.disabled = True
+            self.initialized = True
+            return
 
-                ops.dispose(self.fa)
-            except Exception as exc:
-                logger.warning("Aiter CustomAR dispose on close failed: %s", exc)
-            self.fa = 0
-        self.buffer = None
-        self._meta = None
-        self._rank_data = None
-        self.disabled = True
-        self.initialized = False
+        try:
+            ar = CustomAllreduce(
+                group=gloo_group,
+                device=device_id,
+                max_size=self.max_size,
+                enable_register_for_capturing=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "aiter CustomAllreduce: instantiate failed: %s",
+                exc,
+                exc_info=True,
+            )
+            self.disabled = True
+            self.initialized = True
+            return
+
+        if ar.disabled:
+            logger.warning(
+                "aiter CustomAllreduce: instance is disabled (cross-node, "
+                "world_size, or hardware check failed)"
+            )
+            self.disabled = True
+            self.initialized = True
+            return
+
+        self.group = group
+        self.gloo_group = gloo_group
+        self.device_id = device_id
+        self.rank = dist.get_rank(group=group)
+        self.world_size = world_size
+        self.ar = ar
+        self.initialized = True
+        self.disabled = False
+        logger.info(
+            "aiter CustomAllreduce initialized: rank=%d, ws=%d, device=%d",
+            self.rank,
+            world_size,
+            device_id,
+        )
 
     def ensure_initialized(self, group: ProcessGroup, device_id: int) -> bool:
-        """Lazily initialize and return True if comm is usable."""
+        """Lazy-init on first call. Returns True if usable."""
         if not self.initialized:
             self.initialize(group, device_id)
         return self.initialized and not self.disabled
 
     def should_use(self, tensor: Tensor, group: ProcessGroup, device_id: int) -> bool:
-        """Check whether *tensor* is eligible for aiter CustomAllreduce.
-
-        State-only — never triggers (re-)initialization. Call sites must
-        run ``ensure_initialized`` outside of stream capture beforehand.
-        """
-        if not self.initialized or self.disabled or self.fa == 0:
+        """Check whether *tensor* is eligible. State-only — never triggers
+        (re-)initialization. Call ``ensure_initialized`` outside of stream
+        capture beforehand."""
+        if not self.initialized or self.disabled or self.ar is None:
             return False
         if self.group is not group or self.device_id != device_id:
             return False
         if tensor.dtype not in _SUPPORTED_DTYPES:
             return False
-        inp_size = tensor.numel() * tensor.element_size()
-        if inp_size % 16 != 0:
-            return False
-        # 2-stage allreduce write mode uses 2x temp buffer,
-        # so effective limit is max_size / 2
-        return inp_size <= self.max_size // 2
+        return self.ar.should_custom_ar(tensor)
 
     def allreduce(self, tensor: Tensor) -> Tensor:
-        """AllReduce *tensor* via aiter P2P custom allreduce.
+        """AllReduce *tensor*. Returns a NEW tensor (out-of-place semantics).
 
-        Supports BF16 and FP8 dtypes.
+        In HIPGraph capture mode the wrapper records input/output addresses
+        for later IPC registration (zero staging copy). Outside capture, a
+        staging-buffer fast path is used.
         """
-        import aiter as ops
-
-        out = torch.empty_like(tensor)
-        is_fp8 = tensor.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-
-        ops.all_reduce(
-            self.fa,
-            tensor,
-            out,
-            False,
-            is_fp8,
-            self.buffer,
-        )
+        if not self.initialized or self.disabled or self.ar is None:
+            raise RuntimeError("aiter CustomAllreduce not ready")
+        out = self.ar.custom_all_reduce(tensor)
+        if out is None:
+            raise RuntimeError(
+                f"aiter CustomAllreduce refused tensor "
+                f"(shape={tuple(tensor.shape)}, dtype={tensor.dtype})"
+            )
         return out
+
+    def close(self) -> None:
+        """Release the underlying CustomAllreduce + IPC handles. Idempotent."""
+        if self.ar is not None:
+            try:
+                close_fn = getattr(self.ar, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception as exc:
+                logger.warning("aiter CustomAllreduce close failed: %s", exc)
+        self.ar = None
+        self.group = None
+        self.gloo_group = None
+        self.device_id = None
+        self.initialized = False
+        self.disabled = True
+
+    # -- HIPGraph capture flow integration -------------------------------------
+    # rtp-llm's CudaGraphRunner runs:
+    #   enter_hipgraph_capture_mode  ->  enter_capture()  (set _IS_CAPTURING)
+    #   ... HIPGraph capture runs, AR calls record IPC slots ...
+    #   exit_hipgraph_capture_mode   ->  exit_capture()   (clear flag + flush)
+    #
+    # We flush eagerly in exit_capture (not deferred to finish_session)
+    # because CudaGraphRunner runs replayAndSyncCheck() right after each
+    # per-batch capture — before any finish-session hook fires. Deferred
+    # flush would leave the slot table uninitialised and the replay would
+    # GPU-fault.
+    def enter_capture(self) -> None:
+        if not self.initialized or self.disabled or self.ar is None:
+            return
+        self.ar._IS_CAPTURING = True
+        self._is_capture_active = True
+
+    def exit_capture(self) -> None:
+        """Clear capture flag AND immediately register any pending IPC handles.
+        Must NOT be called inside a HIPGraph capture stream."""
+        if not self.initialized or self.disabled or self.ar is None:
+            return
+        self.ar._IS_CAPTURING = False
+        self._is_capture_active = False
+        if torch.cuda.is_current_stream_capturing():
+            logger.warning(
+                "aiter exit_capture: stream still capturing; deferring flush"
+            )
+            return
+        try:
+            from aiter.ops.custom_all_reduce import get_graph_buffer_count
+
+            count = get_graph_buffer_count(self.ar._ptr)
+        except Exception:
+            count = None
+        if count == 0:
+            return
+        try:
+            self.ar.register_graph_buffers()
+            # Ensure register_graph_buffers' device-side per_call_ptrs writes
+            # are visible to the subsequent graph replay (different stream).
+            torch.cuda.synchronize()
+        except Exception as exc:
+            logger.warning(
+                "aiter register_graph_buffers failed: %s",
+                exc,
+                exc_info=True,
+            )
+
+    def has_pending_capture(self) -> bool:
+        if not self.initialized or self.disabled or self.ar is None:
+            return False
+        try:
+            from aiter.ops.custom_all_reduce import get_graph_buffer_count
+
+            return get_graph_buffer_count(self.ar._ptr) > 0
+        except Exception:
+            return False
+
+    def consume_capture(self) -> None:
+        """Drain pending graph-IPC unregistered list (collective). Safe to
+        call only outside HIPGraph capture stream."""
+        if not self.initialized or self.disabled or self.ar is None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "aiter consume_capture must not run during stream capture."
+            )
+        if self.has_pending_capture():
+            try:
+                self.ar.register_graph_buffers()
+            except Exception as exc:
+                logger.warning(
+                    "aiter consume_capture register_graph_buffers failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+
 
 aiter_ar_manager = _AiterARManager()

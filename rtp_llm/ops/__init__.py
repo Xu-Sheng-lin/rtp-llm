@@ -105,7 +105,10 @@ except BaseException as e:
 import sysconfig
 from ctypes import cdll
 
-cdll.LoadLibrary(sysconfig.get_config_var("LIBDIR") + "/libpython3.10.so")
+_libpython_path = sysconfig.get_config_var("LIBDIR") + "/libpython3.10.so"
+if not os.path.exists(_libpython_path):
+    _libpython_path = "/opt/conda310/lib/libpython3.10.so"
+cdll.LoadLibrary(_libpython_path)
 
 try:
     from libth_transformer_config import (

@@ -204,7 +204,9 @@ def _get_rccl_runtime(
         raise RuntimeError(
             "RCCL library is not available for HIPGraph capture collectives"
         )
-    if (_rccl_comm is None or _rccl_comm.value is None) and not _is_hipgraph_capture_active():
+    if (
+        _rccl_comm is None or _rccl_comm.value is None
+    ) and not _is_hipgraph_capture_active():
         _ensure_rccl_comm_from_process_group(process_group)
     if _rccl_comm is None or _rccl_comm.value is None:
         raise RuntimeError(
@@ -274,6 +276,7 @@ def set_hipgraph_capture_nccl_comm(
     # `prepare_hipgraph_capture_rccl_comm_if_needed` runs with the right
     # tp_group. Pre-init is the sole responsibility of the latter path.
 
+
 # ---------------------------------------------------------------------------
 # ROCm AllReduce strategy flags (single source of truth — read once at import).
 #
@@ -293,6 +296,7 @@ def set_hipgraph_capture_nccl_comm(
 # ---------------------------------------------------------------------------
 _VALID_STRATEGIES = {"quick", "trtllm", "aiter", "none"}
 
+
 def _parse_enabled_strategies() -> set:
     """Parse ROCM_ALLREDUCE_STRATEGY into a set of enabled tier tokens.
 
@@ -309,6 +313,7 @@ def _parse_enabled_strategies() -> set:
         tokens -= invalid
     return tokens if tokens else {"none"}
 
+
 _rocm_allreduce_strategies: set = (
     _parse_enabled_strategies() if _is_rocm_runtime else {"none"}
 )
@@ -322,6 +327,7 @@ if _is_rocm_runtime and _rocm_allreduce_strategies != {"none"}:
         "quick→trtllm→aiter→symm_mem→NCCL): %s",
         sorted(_rocm_allreduce_strategies - {"none"}),
     )
+
 
 def _pre_init_allreduce_strategies(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -356,14 +362,20 @@ def _pre_init_allreduce_strategies(
             from rtp_llm.models_py.modules.base.rocm.trt_allreduce import (
                 ensure_trtllm_comm_initialized,
             )
+
             ensure_trtllm_comm_initialized(group=tp_group, device_id=device_id)
-            logging.info("Pre-init trtllm_allreduce succeeded (device_id=%s)", device_id)
+            logging.info(
+                "Pre-init trtllm_allreduce succeeded (device_id=%s)", device_id
+            )
         except Exception as exc:
             logging.warning("Pre-init trtllm_allreduce failed (non-fatal): %s", exc)
 
     if _enable_quick_allreduce:
         try:
-            from rtp_llm.models_py.modules.base.rocm.quick_allreduce import quick_ar_manager
+            from rtp_llm.models_py.modules.base.rocm.quick_allreduce import (
+                quick_ar_manager,
+            )
+
             quick_ar_manager.ensure_initialized(group=tp_group, device_id=device_id)
             logging.info("Pre-init quick_allreduce succeeded (device_id=%s)", device_id)
         except Exception as exc:
@@ -378,14 +390,18 @@ def _pre_init_allreduce_strategies(
             from rtp_llm.models_py.modules.base.rocm.aiter_custom_allreduce import (
                 aiter_ar_manager,
             )
+
             aiter_ar_manager.ensure_initialized(group=tp_group, device_id=device_id)
             logging.info(
-                "Pre-init aiter_custom_allreduce succeeded (device_id=%s)", device_id,
+                "Pre-init aiter_custom_allreduce succeeded (device_id=%s)",
+                device_id,
             )
         except Exception as exc:
             logging.warning(
-                "Pre-init aiter_custom_allreduce failed (non-fatal): %s", exc,
+                "Pre-init aiter_custom_allreduce failed (non-fatal): %s",
+                exc,
             )
+
 
 def _warmup_rccl_collectives(
     lib: ctypes.CDLL, comm: ctypes.c_void_p, world_size: int
@@ -400,23 +416,30 @@ def _warmup_rccl_collectives(
         nccl_float = _get_nccl_dtype(dummy_in)
 
         res = lib.ncclAllGather(
-            dummy_in.data_ptr(), ag_out.data_ptr(),
-            dummy_in.numel(), nccl_float, comm, stream,
+            dummy_in.data_ptr(),
+            ag_out.data_ptr(),
+            dummy_in.numel(),
+            nccl_float,
+            comm,
+            stream,
         )
         if res != _NCCL_SUCCESS:
             logging.warning("RCCL AllGather warmup returned error %d", res)
 
         res = lib.ncclAllReduce(
-            ar_out.data_ptr(), ar_out.data_ptr(),
-            ar_out.numel(), nccl_float, _NCCL_SUM, comm, stream,
+            ar_out.data_ptr(),
+            ar_out.data_ptr(),
+            ar_out.numel(),
+            nccl_float,
+            _NCCL_SUM,
+            comm,
+            stream,
         )
         if res != _NCCL_SUCCESS:
             logging.warning("RCCL AllReduce warmup returned error %d", res)
 
         torch.cuda.synchronize(device)
-        logging.info(
-            "RCCL collective warmup succeeded (world_size=%d)", world_size
-        )
+        logging.info("RCCL collective warmup succeeded (world_size=%d)", world_size)
     except Exception as e:
         logging.warning("RCCL collective warmup failed (non-fatal): %s", e)
 
@@ -529,13 +552,39 @@ def enter_hipgraph_capture_mode(
     # C++ registration path is responsible for explicit clear via
     # set_hipgraph_capture_nccl_comm(0, 0, rank) when needed.
 
+    # aiter CustomAllreduce: mark capture-in-progress so subsequent AR calls
+    # take the registered-buffer path (no staging copy) and queue input/output
+    # addresses for batch IPC registration on capture exit.
+    if _enable_aiter_custom_ar:
+        try:
+            from rtp_llm.models_py.modules.base.rocm.aiter_custom_allreduce import (
+                aiter_ar_manager,
+            )
+
+            aiter_ar_manager.enter_capture()
+        except Exception as exc:
+            logging.warning("aiter enter_capture failed (non-fatal): %s", exc)
+
 
 def exit_hipgraph_capture_mode() -> None:
     """Called by C++ exit_graph_capture() before setHipGraphCaptureEnabled(false).
 
     consume_capture is deferred to finish_hipgraph_capture_session() to
     avoid ProcessGroupNCCL watchdog hipErrorCapturedEvent races.
+
+    aiter CustomAllreduce is an exception: we MUST flush its graph-buffer
+    queue here (before the next replayAndSyncCheck), otherwise the replay
+    reads from an unregistered IPC slot table and GPU-faults.
     """
+    if _enable_aiter_custom_ar:
+        try:
+            from rtp_llm.models_py.modules.base.rocm.aiter_custom_allreduce import (
+                aiter_ar_manager,
+            )
+
+            aiter_ar_manager.exit_capture()
+        except Exception as exc:
+            logging.warning("aiter exit_capture failed (non-fatal): %s", exc)
     return
 
 
@@ -552,17 +601,30 @@ def finish_hipgraph_capture_session() -> None:
             has_pending_capture,
         )
     except ImportError:
-        return
-    if has_pending_capture():
+        consume_capture = has_pending_capture = None
+    if consume_capture is not None and has_pending_capture():
         consume_capture()
+
+    # aiter CustomAllreduce: drain any leftover graph-IPC entries that the
+    # eager exit_capture didn't flush (defensive — should be no-op since
+    # exit_capture flushes per-graph).
+    if _enable_aiter_custom_ar:
+        try:
+            from rtp_llm.models_py.modules.base.rocm.aiter_custom_allreduce import (
+                aiter_ar_manager,
+            )
+
+            if aiter_ar_manager.has_pending_capture():
+                aiter_ar_manager.consume_capture()
+        except Exception as exc:
+            logging.warning(
+                "aiter consume_capture in finish_hipgraph_capture_session failed: %s",
+                exc,
+            )
 
 
 def should_use_hipgraph_capture_rccl(is_tp_group: bool) -> bool:
-    return (
-        _is_rocm_runtime
-        and is_tp_group
-        and _is_hipgraph_capture_active()
-    )
+    return _is_rocm_runtime and is_tp_group and _is_hipgraph_capture_active()
 
 
 def ensure_tp_rccl_comm_for_capture(is_tp_group: bool) -> None:
@@ -584,19 +646,26 @@ def _is_hidden_size_supported_for_trtllm(hidden_size: int) -> bool:
         from rtp_llm.models_py.modules.base.rocm.trt_allreduce import (
             ALLREDUCE_SUPPORTED_HIDDEN_SIZES,
         )
+
         return hidden_size in ALLREDUCE_SUPPORTED_HIDDEN_SIZES
     except Exception:
         return False
 
+
 def _is_trtllm_allreduce_ready() -> bool:
     try:
-        from rtp_llm.models_py.modules.base.rocm.trt_allreduce import is_trt_allreduce_ready
+        from rtp_llm.models_py.modules.base.rocm.trt_allreduce import (
+            is_trt_allreduce_ready,
+        )
+
         return is_trt_allreduce_ready()
     except ImportError:
         return False
 
+
 _trtllm_fallback_warned: bool = False
 _quick_fallback_warned: bool = False
+_aiter_fallback_warned: bool = False
 
 
 def hipgraph_capture_all_reduce(
@@ -605,24 +674,26 @@ def hipgraph_capture_all_reduce(
 ) -> torch.Tensor:
     """Allreduce during HIPGraph capture.
 
-    Priority: quick_AR -> trtllm_AR -> ncclAllReduce.
+    Priority: quick_AR -> aiter_custom_AR -> trtllm_AR -> ncclAllReduce.
 
-    Both quick_AR and trtllm_AR must have been pre-initialized via
-    _pre_init_allreduce_strategies() before capture begins, since their
-    init paths call hipMalloc/all_gather_object which are forbidden under
-    stream capture. ``should_use`` is therefore safe to call here because
-    it only triggers lazy init when ``initialized`` is False — which
-    cannot happen if pre-init ran for the enabled strategies.
+    All accelerated tiers must be pre-initialized via
+    _pre_init_allreduce_strategies() before capture begins. ``should_use``
+    is safe to call here because it only does state lookup, never lazy init.
 
-    Note: aiter P2P custom AR is intentionally skipped in capture mode
-    (its handshake/buffer-registration path is not graph-capture safe).
+    aiter_custom_AR uses graph-aware IPC registration (records input/output
+    addresses to a queue during capture, batch-flushes via
+    register_graph_buffers on capture exit). This is robust against PyTorch
+    caching allocator reuse — the same scenario that triggered the
+    trt-allreduce-stale-ipc-cache bug.
     """
-    global _trtllm_fallback_warned, _quick_fallback_warned
+    global _trtllm_fallback_warned, _quick_fallback_warned, _aiter_fallback_warned
 
-    # Tier 1: Quick AllReduce (opt-in, fastest)
+    # Tier 1: Quick AllReduce (opt-in, fastest, quantised/lossy)
     if _enable_quick_allreduce and process_group is not None:
         try:
-            from rtp_llm.models_py.modules.base.rocm.quick_allreduce import quick_ar_manager
+            from rtp_llm.models_py.modules.base.rocm.quick_allreduce import (
+                quick_ar_manager,
+            )
 
             device_id = torch.cuda.current_device()
             if quick_ar_manager.should_use(tensor, process_group, device_id):
@@ -631,9 +702,31 @@ def hipgraph_capture_all_reduce(
             if not _quick_fallback_warned:
                 logging.warning(
                     "quick_allreduce failed in graph capture mode, "
-                    "fallback to next tier (further warnings suppressed): %s", exc,
+                    "fallback to next tier (further warnings suppressed): %s",
+                    exc,
                 )
                 _quick_fallback_warned = True
+
+    # Tier 2: aiter CustomAllreduce (lossless, graph-capture safe via
+    # register_graph_buffers). Eliminates the ~325us/step rocclr_copyBuffer
+    # staging copy that trt_allreduce safe-path requires.
+    if _enable_aiter_custom_ar and process_group is not None:
+        try:
+            from rtp_llm.models_py.modules.base.rocm.aiter_custom_allreduce import (
+                aiter_ar_manager,
+            )
+
+            device_id = torch.cuda.current_device()
+            if aiter_ar_manager.should_use(tensor, process_group, device_id):
+                return aiter_ar_manager.allreduce(tensor)
+        except Exception as exc:
+            if not _aiter_fallback_warned:
+                logging.warning(
+                    "aiter_custom_allreduce failed in graph capture mode, "
+                    "fallback to next tier (further warnings suppressed): %s",
+                    exc,
+                )
+                _aiter_fallback_warned = True
 
     # Tier 2: trtllm allreduce
     if (
@@ -646,6 +739,7 @@ def hipgraph_capture_all_reduce(
             from rtp_llm.models_py.modules.base.rocm.trt_allreduce import (
                 allreduce as trtllm_allreduce,
             )
+
             device_id = torch.cuda.current_device()
             return trtllm_allreduce(
                 allreduce_in=tensor,
@@ -656,7 +750,8 @@ def hipgraph_capture_all_reduce(
             if not _trtllm_fallback_warned:
                 logging.warning(
                     "trtllm_allreduce failed in graph capture mode, "
-                    "fallback to ncclAllReduce (further warnings suppressed): %s", exc,
+                    "fallback to ncclAllReduce (further warnings suppressed): %s",
+                    exc,
                 )
                 _trtllm_fallback_warned = True
 
@@ -783,6 +878,7 @@ def _close_allreduce_strategies() -> None:
             from rtp_llm.models_py.modules.base.rocm.quick_allreduce import (
                 quick_ar_manager,
             )
+
             quick_ar_manager.close()
         except Exception as exc:
             logging.warning("quick_ar_manager.close() failed: %s", exc)
@@ -791,6 +887,7 @@ def _close_allreduce_strategies() -> None:
             from rtp_llm.models_py.modules.base.rocm.aiter_custom_allreduce import (
                 aiter_ar_manager,
             )
+
             aiter_ar_manager.close()
         except Exception as exc:
             logging.warning("aiter_ar_manager.close() failed: %s", exc)
@@ -799,6 +896,7 @@ def _close_allreduce_strategies() -> None:
             from rtp_llm.models_py.modules.base.rocm.trt_allreduce import (
                 _trtllm_comm_manager,
             )
+
             _trtllm_comm_manager.cleanup()
         except Exception as exc:
             logging.warning("trtllm_comm_manager.cleanup() failed: %s", exc)
